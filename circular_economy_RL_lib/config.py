@@ -25,7 +25,7 @@ config = {
     # Bilevel Reinforcement Learning (BRL) Hyperparameters (Gaur et al. 2025)
     'lambda_penalty': 0.5,         # Penalty coefficient (lambda) for value gap
     'lr_leader': 3e-4,             # Slower learning rate for the Upper-Level Leader (phi)
-    'lr_follower': 1e-3,           # Faster learning rate for the Lower-Level Followers (theta)
+    'lr_follower': 3e-4,           # Faster learning rate for the Lower-Level Followers (theta)
     'leader_update_frequency': 5,  # Slower timescale ratio (updates leader once every N epochs)
     
     # Training parameters
