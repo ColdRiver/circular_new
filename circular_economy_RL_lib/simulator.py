@@ -7,7 +7,7 @@ class Manufacturing_Simulator:
     Bilevel Environment Class
     -- reset: returns the global leader state and decentralized follower states
     -- step_sell: receives upper-level action phi and establishes collective market rules
-    -- step_buy: computes transactions, allocating wastewater recycle subsidies and dumping taxes
+    -- step_buy: computes P2P transactions and returns follower rewards
     -- step_trans: evaluates non-linear surrogate networks and transitions inventories
     """
     def __init__(self):
@@ -62,12 +62,12 @@ class Manufacturing_Simulator:
         """
         avg_spot = np.mean(self.spot_price[:, self.t-self.history_length:self.t], axis=1)
         total_waste_landfilled = np.sum(self.spot_q[:, :, self.t-1]) if self.t > self.history_length else 0.
-        total_freshwater = np.sum(self.inv[:, 0, self.t]) # Water is commodity index 0
+        total_freshwater = np.sum(self.inv[:, 0, self.t])
         return np.concatenate((avg_spot, [total_waste_landfilled, total_freshwater]))
 
     def get_follower_state(self):
         """
-        Decentralized follower state tracking localized inventories and physical dynamics
+        Decentralized follower state tracking localized inventories and physical dynamics (1824 dimensions)
         """
         follower_states = []
         start_time = self.t - self.history_length
@@ -75,28 +75,60 @@ class Manufacturing_Simulator:
             p = self.spot_price[..., start_time:self.t].flatten()
             e = self.price[..., start_time:self.t].flatten()
             ew = self.waste_price[..., start_time:self.t].flatten()
+
             q = self.q[:, n, :, start_time:self.t].flatten()
             qw = self.waste_q[:, n, :, start_time:self.t].flatten()
+
+            q_ = self.q[n, :, :, start_time:self.t].flatten()
+            qw_ = self.waste_q[n, :, :, start_time:self.t].flatten()
+
             qs = self.spot_q[n, :, start_time:self.t].flatten()
+
+            d = self.actual_d[n, :, :, start_time:self.t].flatten()
+            dw = self.waste_actual_d[n, :, :, start_time:self.t].flatten()
+
             I = self.inv[n, :, start_time:self.t+1].flatten()
             Iw = self.waste_inv[n, :, start_time:self.t+1].flatten()
+
             u_eco = self.eco_u[n, :, start_time:self.t].flatten()
             u_tx = self.tx_u[n, :, start_time:self.t].flatten()   
             
-            state_flat = np.concatenate((p, e, ew, q, qw, qs, I, Iw, u_eco, u_tx))
+            state_flat = np.concatenate((p, e, ew, q, qw, q_, qw_, qs, d, dw, I, Iw, u_eco, u_tx))
             follower_states.append(state_flat)
 
         return np.array(follower_states)
 
+    def get_trans_state(self, buyer_states):
+        """
+        Constructs the transformation state of size 2004 for the followers
+        """
+        trans_states = []
+        for n in range(self.num_agents):
+            state_flat = buyer_states[n]
+            
+            # Concatenate buyer actions (total size 84)
+            q_flat = self.q[n].flatten()               
+            waste_q_flat = self.waste_q[n].flatten()   
+            spot_q_flat = self.spot_q[n].flatten()     
+            state_flat = np.concatenate([state_flat, q_flat, waste_q_flat, spot_q_flat])
+            
+            # Concatenate environmental updates (total size 96)
+            actual_d_flat = self.actual_d[n].flatten()             
+            waste_actual_d_flat = self.waste_actual_d[n].flatten() 
+            inv_buy_flat = self.inv_buy[n].flatten()               
+            waste_inv_buy_flat = self.waste_inv_buy[n].flatten()   
+            state_flat = np.concatenate([state_flat, actual_d_flat, waste_actual_d_flat, inv_buy_flat, waste_inv_buy_flat])
+            
+            trans_states.append(state_flat)
+        return np.array(trans_states)
+
     def step_sell(self, orig_leader_action):
         """
         Phase 1: Upper-Level Leader sets baseline pricing constraints (phi)
-        phi = [price_multiplier, recycle_subsidy, landfill_tax]
         """
         phi = np.clip(orig_leader_action, 0.1, 10.0)
         self.active_phi = phi
         
-        # Scale exchange and waste prices globally based on the price multiplier
         for n in range(self.num_agents):
             self.price[n, :, self.t] = phi[0] * self.spot_price[:, self.t]
             self.waste_price[n, :, self.t] = 0.5 * self.price[n, :, self.t]
@@ -132,7 +164,6 @@ class Manufacturing_Simulator:
         for key, value in buyer_actions.items():
             getattr(self, key)[..., self.t] = value
 
-        # Run transaction volume execution rules
         actual_d = self.calc_actual_sold(self.q[:, :, :, self.t], self.inv[:, :, self.t])
         actual_dw = self.calc_actual_sold(self.waste_q[:, :, :, self.t], self.waste_inv[:, :, self.t])
         
@@ -145,7 +176,6 @@ class Manufacturing_Simulator:
         self.inv_buy[..., self.t] = inv_buy
         self.waste_inv_buy[..., self.t] = waste_inv_buy
 
-        # Compute followers' financial returns incorporating subsidies & taxes
         buyer_rewards = []
         for n in range(self.num_agents):
             e_reshape = self.price[:, :, self.t]
@@ -156,14 +186,12 @@ class Manufacturing_Simulator:
             reward -= np.sum(self.waste_actual_d[n, :, :, self.t] * ew_reshape)
             reward -= np.sum(self.spot_q[n, :, self.t] * p_reshape)
             
-            # Apply subsidies for circular P2P waste transfer
             reward += self.active_phi[1] * np.sum(self.waste_actual_d[n, :, :, self.t])
-            # Penalize landfill dumping
             reward -= self.active_phi[2] * np.sum(self.spot_q[n, :, self.t])
             
             buyer_rewards.append(reward * self.RWD_SCALE)
 
-        return self.get_follower_state(), np.array(buyer_rewards)
+        return np.array(buyer_rewards)
 
     def step_trans(self, orig_trans_actions):
         """
@@ -192,7 +220,6 @@ class Manufacturing_Simulator:
         )
         self.waste_inv[:, :, self.t + 1] = (1 - self.delta) * (self.waste_inv_buy[:, :, self.t] + w_bot)
 
-        # Compute transformer rewards
         uc_p = self.uc_p[:, self.t]
         tx_p = self.tx_p[:, self.t]
         trans_rewards = []
@@ -200,7 +227,6 @@ class Manufacturing_Simulator:
             r = np.sum(self.eco_u[n, :, self.t] * uc_p) - np.sum(self.tx_u[n, :, self.t] * tx_p)
             trans_rewards.append(r * self.RWD_SCALE)
 
-        # Compute macro-level Leader Reward
         recycled_volume = np.sum(self.waste_actual_d[..., self.t])
         landfilled_volume = np.sum(self.spot_q[..., self.t])
         freshwater_consumption = np.sum(self.inv[:, 0, self.t])
@@ -246,7 +272,6 @@ class Manufacturing_Simulator:
         agent1_surrogate_output_vec = self.surrogate_model.get_pap_model_outputs(agent1_surrogate_input_vec.reshape(1,-1))
         agents_final_output_vec[1, [11, 5]] = np.array(agent1_surrogate_output_vec)[0, [0, 1]]
 
-        # Hydrogen surrogate processing
         water_conv = agent2[0] if agent2[0] >= 19.*agent2[2] else 20.*agent2[0]/19.
         agent2_surrogate_input_vec = np.array([water_conv])
         agent2_surrogate_output_vec = self.surrogate_model.get_hyd_model_outputs(agent2_surrogate_input_vec.reshape(1,-1))
