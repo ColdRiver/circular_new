@@ -58,7 +58,10 @@ class OptimalFollowerValueEstimator(nn.Module):
     def update(self, state_phi, target_returns):
         self.optimizer.zero_grad()
         predictions = self.forward(state_phi).squeeze()
-        targets = torch.tensor(target_returns, dtype=torch.float32)
+        
+        # Defensive check against redundant tracking graph operations
+        targets = target_returns.clone().detach() if isinstance(target_returns, torch.Tensor) else torch.tensor(target_returns, dtype=torch.float32)
+        
         loss = nn.MSELoss()(predictions, targets)
         loss.backward()
         self.optimizer.step()
