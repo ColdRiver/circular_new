@@ -17,10 +17,13 @@ class Actor(nn.Module):
     def forward(self, x):
         if isinstance(x, np.ndarray):
             x = torch.tensor(x, dtype=torch.float32)
+
         x = F.relu(self.layer1(x))
         x = F.relu(self.layer2(x))
         x = self.layer3(x)
-        return torch.clamp(x, min=0.01, max=100.0)
+        
+        # Softly map the raw outputs between 0.01 and 100.0 to prevent gradient vanishing
+        return torch.sigmoid(x) * 99.99 + 0.01
 
 class Critic(nn.Module):
     def __init__(self, n_observations, hidden_dims=128):
