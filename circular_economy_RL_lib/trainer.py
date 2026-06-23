@@ -54,7 +54,7 @@ class BilevelTrainer:
                 batch_obs[LEADER].append(s_leader)
                 phi, log_p_leader = self.leader_agent.get_action(s_leader)
                 batch_acts[LEADER].append(phi)
-                batch_log_probs[SELLER].append(log_prob_s) if False else batch_log_probs[LEADER].append(log_p_leader)
+                batch_log_probs[LEADER].append(log_p_leader)
                 
                 # Update follower environment with regulatory state
                 s_follower = self.env.step_sell(phi)
