@@ -52,7 +52,7 @@ class BilevelTrainer:
                 
                 # --- Step 1: Upper-Level Leader decides rules (phi) ---
                 batch_obs[LEADER].append(s_leader)
-                phi, log_p_leader = self.leader_agent.get_action(s_leader)
+                phi, log_p_leader = self.leader_agent.get_action(s_leader/100.0)
                 batch_acts[LEADER].append(phi)
                 batch_log_probs[LEADER].append(log_p_leader)
                 
@@ -67,7 +67,7 @@ class BilevelTrainer:
                 buyer_actions = []
                 log_p_buyers = []
                 for ag in range(self.num_agents):
-                    act_b, log_p_b = self.buyer_agents[ag].get_action(s_buyer[ag])
+                    act_b, log_p_b = self.buyer_agents[ag].get_action(s_buyer[ag]/100.0)
                     buyer_actions.append(act_b)
                     log_p_buyers.append(log_p_b)
                 
@@ -86,7 +86,7 @@ class BilevelTrainer:
                 trans_actions = []
                 log_p_trans = []
                 for ag in range(self.num_agents):
-                    act_t, log_p_t = self.trans_agents[ag].get_action(s_trans[ag])
+                    act_t, log_p_t = self.trans_agents[ag].get_action(s_trans[ag]/100.0)
                     trans_actions.append(act_t)
                     log_p_trans.append(log_p_t)
                 
@@ -152,7 +152,7 @@ class BilevelTrainer:
             for ag in range(self.num_agents):
                 # Update Buyer Agents
                 a_loss_b, c_loss_b = self.buyer_agents[ag].learn(
-                    batch_obs[BUYER][:, ag], batch_acts[BUYER][:, ag], 
+                    batch_obs[BUYER][:, ag] / 100.0, batch_acts[BUYER][:, ag], 
                     batch_log_probs[BUYER][:, ag], batch_rtgs[BUYER][:, ag], 10
                 )
                 self.writer.add_scalar(f'buyer_actor_loss_agent_{ag}', a_loss_b, t_so_far)
@@ -160,7 +160,7 @@ class BilevelTrainer:
 
                 # Update Transformer Agents
                 a_loss_t, c_loss_t = self.trans_agents[ag].learn(
-                    batch_obs[TRANSFORM][:, ag], batch_acts[TRANSFORM][:, ag], 
+                    batch_obs[TRANSFORM][:, ag] / 100.0, batch_acts[TRANSFORM][:, ag], 
                     batch_log_probs[TRANSFORM][:, ag], batch_rtgs[TRANSFORM][:, ag], 10
                 )
                 self.writer.add_scalar(f'trans_actor_loss_agent_{ag}', a_loss_t, t_so_far)
@@ -169,7 +169,7 @@ class BilevelTrainer:
             # --- Update Best-Response Value Estimator (Gaur et al. 2025) ---
             for ag in range(self.num_agents):
                 flat_phi = batch_acts[LEADER].reshape(-1, self.leader_act_dim)
-                flat_state = batch_obs[BUYER][:, ag]
+                flat_state = batch_obs[BUYER][:, ag] / 100.0  # Normalized state
                 estimator_input = torch.cat([flat_phi, flat_state], dim=-1)
                 target_returns = batch_rtgs[BUYER][:, ag]
                 
@@ -184,7 +184,7 @@ class BilevelTrainer:
                     flat_state = batch_obs[BUYER][:, ag]
                     estimator_input = torch.cat([flat_phi, flat_state], dim=-1)
                     
-                    v_star = self.best_response_estimator(estimator_input).squeeze()
+                    v_star = self.best_response_estimator(estimator_input).squeeze().detach()
                     v_actual = batch_rtgs[BUYER][:, ag]
                     penalties.append(v_star - v_actual)
                 
@@ -192,7 +192,7 @@ class BilevelTrainer:
                 penalized_rtgs = batch_rtgs[LEADER] - self.lambda_penalty * total_penalty
 
                 a_loss_l, c_loss_l = self.leader_agent.learn(
-                    batch_obs[LEADER], batch_acts[LEADER], 
+                    batch_obs[LEADER] / 100.0, batch_acts[LEADER], 
                     batch_log_probs[LEADER], penalized_rtgs, 10
                 )
                 self.writer.add_scalar('leader_actor_loss', a_loss_l, t_so_far)
