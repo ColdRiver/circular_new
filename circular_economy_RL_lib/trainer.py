@@ -17,21 +17,18 @@ class BilevelTrainer:
         os.makedirs(self.result_folder + '/debug', exist_ok=True)
         self.writer = SummaryWriter(self.result_folder + '/log')
 
-        # Dimensional setups
         self.leader_obs_dim = self.num_commodities + 2
-        self.leader_act_dim = 3  # phi = [price_multiplier, recycle_subsidy, landfill_tax]
+        self.leader_act_dim = 3  
         
         self.follower_obs_dim = self.num_commodities * self.history_length * (6 + self.num_agents * 8) + 2 * self.num_commodities
         self.buyer_act_dim = 2 * self.num_commodities * (self.num_agents - 1) + self.num_commodities
         self.trans_act_dim = 2 * self.num_commodities
 
-        # Instantiating the networks
         self.leader_agent = PPOAgent(self.leader_obs_dim, self.leader_act_dim, f"{self.result_folder}/chpkt/leader", lr=self.lr_leader)
         
         self.buyer_agents = [PPOAgent(self.follower_obs_dim, self.buyer_act_dim, f"{self.result_folder}/chpkt/buyer_{ag}", lr=self.lr_follower) for ag in range(self.num_agents)]
         self.trans_agents = [PPOAgent(self.follower_obs_dim + self.num_commodities * (4 * self.num_agents + 3), self.trans_act_dim, f"{self.result_folder}/chpkt/trans_{ag}", lr=self.lr_follower) for ag in range(self.num_agents)]
         
-        # Auxiliary Best-Response Value Network (Gaur et al. 2025)
         self.best_response_estimator = OptimalFollowerValueEstimator(self.leader_act_dim + self.follower_obs_dim)
 
     def rollout(self):
@@ -73,7 +70,10 @@ class BilevelTrainer:
                 batch_log_probs[BUYER].append(log_p_buyers)
 
                 # Step the buying environment
-                s_trans, rew_b = self.env.step_buy(buyer_actions)
+                rew_b = self.env.step_buy(buyer_actions)
+
+                # Reconstruct transformation state representation of size 2004
+                s_trans = self.env.get_trans_state(s_follower)
 
                 # --- Step 3: Followers decide transformation/utility ---
                 batch_obs[TRANSFORM].append(s_trans)
@@ -91,7 +91,6 @@ class BilevelTrainer:
                 # Step the transformation environment
                 s_leader_next, s_follower_next, rew_t, rew_l, done = self.env.step_trans(trans_actions)
 
-                # Accumulate multi-tier rewards
                 ep_rews[LEADER].append(rew_l)
                 ep_rews[BUYER].append(rew_b)
                 ep_rews[TRANSFORM].append(rew_t)
@@ -106,7 +105,6 @@ class BilevelTrainer:
             for stage in stages:
                 batch_rews[stage].append(ep_rews[stage])
 
-        # Convert lists to tensors
         tensor_obs = [torch.tensor(np.array(obs), dtype=torch.float) for obs in batch_obs]
         tensor_acts = [torch.tensor(np.array(act), dtype=torch.float) for act in batch_acts]
         tensor_log_probs = [torch.tensor(np.array(lp), dtype=torch.float) for lp in batch_log_probs]
@@ -145,7 +143,6 @@ class BilevelTrainer:
             i_so_far += 1
 
             # --- Update Lower-Level Follower Policies (theta) ---
-            # Followers update their policies to maximize local cash flows while stabilizing under active rules
             for ag in range(self.num_agents):
                 # Update Buyer Agents
                 a_loss_b, c_loss_b = self.buyer_agents[ag].learn(
@@ -164,7 +161,6 @@ class BilevelTrainer:
                 self.writer.add_scalar(f'trans_critic_loss_agent_{ag}', c_loss_t, t_so_far)
 
             # --- Update Best-Response Value Estimator (Gaur et al. 2025) ---
-            # Map [phi, s_lower] to predict V*(phi, s_lower)
             for ag in range(self.num_agents):
                 flat_phi = batch_acts[LEADER].reshape(-1, self.leader_act_dim)
                 flat_state = batch_obs[BUYER][:, ag]
@@ -174,10 +170,8 @@ class BilevelTrainer:
                 loss_est = self.best_response_estimator.update(estimator_input, target_returns)
                 self.writer.add_scalar(f'best_response_est_loss_agent_{ag}', loss_est, t_so_far)
 
-            # --- Update Upper-Level Leader Policy (phi - Slower Timescale) ---
-            # Updates on a slower timescale using the unconstrained penalized objective
+            # --- Update Upper-Level Leader Policy (phi) ---
             if i_so_far % self.leader_update_frequency == 0:
-                # Compute value gap penalty: P(phi, theta) = V*(phi) - V_follower
                 penalties = []
                 for ag in range(self.num_agents):
                     flat_phi = batch_acts[LEADER].reshape(-1, self.leader_act_dim)
@@ -188,13 +182,9 @@ class BilevelTrainer:
                     v_actual = batch_rtgs[BUYER][:, ag]
                     penalties.append(v_star - v_actual)
                 
-                # Combine penalties across agents
                 total_penalty = torch.stack(penalties, dim=0).mean(dim=0).unsqueeze(-1)
-                
-                # Reformulate Leader RTGs using the unconstrained penalized objective
                 penalized_rtgs = batch_rtgs[LEADER] - self.lambda_penalty * total_penalty
 
-                # Update the Leader Network
                 a_loss_l, c_loss_l = self.leader_agent.learn(
                     batch_obs[LEADER], batch_acts[LEADER], 
                     batch_log_probs[LEADER], penalized_rtgs, 10
@@ -202,7 +192,6 @@ class BilevelTrainer:
                 self.writer.add_scalar('leader_actor_loss', a_loss_l, t_so_far)
                 self.writer.add_scalar('leader_critic_loss', c_loss_l, t_so_far)
 
-            # Log rewards and circular economy performance metrics
             self.writer.add_scalar('leader_avg_return', np.mean(batch_rets[LEADER]), t_so_far)
             self.writer.add_scalar('buyer_avg_return', np.mean(batch_rets[BUYER]), t_so_far)
             self.writer.add_scalar('trans_avg_return', np.mean(batch_rets[TRANSFORM]), t_so_far)
