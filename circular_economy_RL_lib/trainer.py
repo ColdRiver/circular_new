@@ -17,19 +17,22 @@ class BilevelTrainer:
         os.makedirs(self.result_folder + '/debug', exist_ok=True)
         self.writer = SummaryWriter(self.result_folder + '/log')
 
-        self.leader_obs_dim = self.num_commodities + 2
-        self.leader_act_dim = 3  
+        # Dimensional setup and validation (14, 1824, 1908, 2088)
+        self.seller_obs_dim = self.num_commodities * self.history_length * (6 + self.num_agents * 8) + 2 * self.num_commodities # 1824
+        self.buyer_obs_dim = self.seller_obs_dim + self.num_commodities + 2 * self.num_commodities * self.num_agents # 1908
+        self.trans_obs_dim = self.buyer_obs_dim + self.num_commodities * (4 * self.num_agents + 3) # 2088
         
-        self.follower_obs_dim = self.num_commodities * self.history_length * (6 + self.num_agents * 8) + 2 * self.num_commodities
-        self.buyer_act_dim = 2 * self.num_commodities * (self.num_agents - 1) + self.num_commodities
-        self.trans_act_dim = 2 * self.num_commodities
+        self.buyer_act_dim = 2 * self.num_commodities * (self.num_agents - 1) + self.num_commodities # 60
+        self.trans_act_dim = 2 * self.num_commodities # 24
+        self.leader_act_dim = 3  
+        self.leader_obs_dim = self.num_commodities + 2 # 14
 
         self.leader_agent = PPOAgent(self.leader_obs_dim, self.leader_act_dim, f"{self.result_folder}/chpkt/leader", lr=self.lr_leader)
         
-        self.buyer_agents = [PPOAgent(self.follower_obs_dim, self.buyer_act_dim, f"{self.result_folder}/chpkt/buyer_{ag}", lr=self.lr_follower) for ag in range(self.num_agents)]
-        self.trans_agents = [PPOAgent(self.follower_obs_dim + self.num_commodities * (4 * self.num_agents + 3), self.trans_act_dim, f"{self.result_folder}/chpkt/trans_{ag}", lr=self.lr_follower) for ag in range(self.num_agents)]
+        self.buyer_agents = [PPOAgent(self.buyer_obs_dim, self.buyer_act_dim, f"{self.result_folder}/chpkt/buyer_{ag}", lr=self.lr_follower) for ag in range(self.num_agents)]
+        self.trans_agents = [PPOAgent(self.trans_obs_dim, self.trans_act_dim, f"{self.result_folder}/chpkt/trans_{ag}", lr=self.lr_follower) for ag in range(self.num_agents)]
         
-        self.best_response_estimator = OptimalFollowerValueEstimator(self.leader_act_dim + self.follower_obs_dim)
+        self.best_response_estimator = OptimalFollowerValueEstimator(self.leader_act_dim + self.buyer_obs_dim)
 
     def rollout(self):
         batch_obs = [[] for _ in stages]
@@ -56,12 +59,15 @@ class BilevelTrainer:
                 # Update follower environment with regulatory state
                 s_follower = self.env.step_sell(phi)
 
+                # Reconstruct step 2 buyer states (1908 dimensions)
+                s_buyer = self.env.get_buyer_state(s_follower)
+
                 # --- Step 2: Followers decide trading quantities ---
-                batch_obs[BUYER].append(s_follower)
+                batch_obs[BUYER].append(s_buyer)
                 buyer_actions = []
                 log_p_buyers = []
                 for ag in range(self.num_agents):
-                    act_b, log_p_b = self.buyer_agents[ag].get_action(s_follower[ag])
+                    act_b, log_p_b = self.buyer_agents[ag].get_action(s_buyer[ag])
                     buyer_actions.append(act_b)
                     log_p_buyers.append(log_p_b)
                 
@@ -72,8 +78,8 @@ class BilevelTrainer:
                 # Step the buying environment
                 rew_b = self.env.step_buy(buyer_actions)
 
-                # Reconstruct transformation state representation of size 2004
-                s_trans = self.env.get_trans_state(s_follower)
+                # Reconstruct step 3 transformer states (2088 dimensions)
+                s_trans = self.env.get_trans_state(s_buyer)
 
                 # --- Step 3: Followers decide transformation/utility ---
                 batch_obs[TRANSFORM].append(s_trans)
