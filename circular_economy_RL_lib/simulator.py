@@ -7,7 +7,9 @@ class Manufacturing_Simulator:
     Bilevel Environment Class
     -- reset: returns the global leader state and decentralized follower states
     -- step_sell: receives upper-level action phi and establishes collective market rules
+    -- get_buyer_state: constructs the 1908-dimension state vector for step 2 buyers
     -- step_buy: computes P2P transactions and returns follower rewards
+    -- get_trans_state: constructs the 2088-dimension state vector for step 3 transformers
     -- step_trans: evaluates non-linear surrogate networks and transitions inventories
     """
     def __init__(self):
@@ -58,7 +60,7 @@ class Manufacturing_Simulator:
     
     def get_leader_state(self):
         """
-        Upper-level state reflecting macro-environmental performance
+        Upper-level state reflecting macro-environmental performance (14 dimensions)
         """
         avg_spot = np.mean(self.spot_price[:, self.t-self.history_length:self.t], axis=1)
         total_waste_landfilled = np.sum(self.spot_q[:, :, self.t-1]) if self.t > self.history_length else 0.
@@ -98,25 +100,42 @@ class Manufacturing_Simulator:
 
         return np.array(follower_states)
 
-    def get_trans_state(self, buyer_states):
+    def get_buyer_state(self, s_follower):
         """
-        Constructs the transformation state of size 2004 for the followers
+        Constructs the 1908-dimension state vector for step 2 buyers
+        """
+        buyer_states = []
+        for n in range(self.num_agents):
+            state_flat = s_follower[n]
+            state_flat = np.concatenate((
+                state_flat, 
+                self.spot_price[:, self.t], 
+                self.price[:, :, self.t].flatten(), 
+                self.waste_price[:, :, self.t].flatten()
+            ))
+            buyer_states.append(state_flat)
+        return np.array(buyer_states)
+
+    def get_trans_state(self, s_buyer):
+        """
+        Constructs the 2088-dimension state vector for step 3 transformers
+        Slices all transaction arrays strictly at the current simulation round self.t
         """
         trans_states = []
         for n in range(self.num_agents):
-            state_flat = buyer_states[n]
+            state_flat = s_buyer[n]
             
-            # Concatenate buyer actions (total size 84)
-            q_flat = self.q[n].flatten()               
-            waste_q_flat = self.waste_q[n].flatten()   
-            spot_q_flat = self.spot_q[n].flatten()     
+            # Sliced current step buyer decisions (total size 84)
+            q_flat = self.q[n, :, :, self.t].flatten()               
+            waste_q_flat = self.waste_q[n, :, :, self.t].flatten()   
+            spot_q_flat = self.spot_q[n, :, self.t].flatten()     
             state_flat = np.concatenate([state_flat, q_flat, waste_q_flat, spot_q_flat])
             
-            # Concatenate environmental updates (total size 96)
-            actual_d_flat = self.actual_d[n].flatten()             
-            waste_actual_d_flat = self.waste_actual_d[n].flatten() 
-            inv_buy_flat = self.inv_buy[n].flatten()               
-            waste_inv_buy_flat = self.waste_inv_buy[n].flatten()   
+            # Sliced current step physical responses (total size 96)
+            actual_d_flat = self.actual_d[n, :, :, self.t].flatten()             
+            waste_actual_d_flat = self.waste_actual_d[n, :, :, self.t].flatten() 
+            inv_buy_flat = self.inv_buy[n, :, self.t].flatten()               
+            waste_inv_buy_flat = self.waste_inv_buy[n, :, self.t].flatten()   
             state_flat = np.concatenate([state_flat, actual_d_flat, waste_actual_d_flat, inv_buy_flat, waste_inv_buy_flat])
             
             trans_states.append(state_flat)
