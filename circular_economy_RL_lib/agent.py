@@ -118,7 +118,7 @@ class PPOAgent:
             critic_loss = nn.MSELoss()(V, b_rtgs)
             
             self.actor_optim.zero_grad()
-            actor_loss.backward(retain_graph=True)
+            actor_loss.backward()  # <--- Changed: Removed retain_graph=True
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             self.actor_optim.step()
 
