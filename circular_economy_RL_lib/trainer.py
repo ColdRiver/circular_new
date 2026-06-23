@@ -188,7 +188,7 @@ class BilevelTrainer:
                     v_actual = batch_rtgs[BUYER][:, ag]
                     penalties.append(v_star - v_actual)
                 
-                total_penalty = torch.stack(penalties, dim=0).mean(dim=0).unsqueeze(-1)
+                total_penalty = torch.stack(penalties, dim=0).mean(dim=0).unsqueeze(-1).detach()
                 penalized_rtgs = batch_rtgs[LEADER] - self.lambda_penalty * total_penalty
 
                 a_loss_l, c_loss_l = self.leader_agent.learn(
