@@ -22,7 +22,7 @@ class Actor(nn.Module):
         x = F.relu(self.layer2(x))
         x = self.layer3(x)
         
-        # Softly map outputs between 0.01 and 100.0
+        # Smooth sigmoid scaling to prevent gradient vanishing
         return torch.sigmoid(x) * 99.99 + 0.01
 
 class Critic(nn.Module):
@@ -109,7 +109,9 @@ class PPOAgent:
             b_obs = batch_obs[indices]
             b_acts = batch_acts[indices]
             b_log_probs = batch_log_probs[indices]
-            b_rtgs = batch_rtgs[indices]
+            
+            # Squeeze targets to shape (batch_size,) to prevent PyTorch broadcasting bugs
+            b_rtgs = batch_rtgs[indices].squeeze()
             b_A_k = A_k[indices]
 
             V, curr_log_probs = self.evaluate(b_obs, b_acts)
@@ -121,7 +123,7 @@ class PPOAgent:
             critic_loss = nn.MSELoss()(V, b_rtgs)
             
             self.actor_optim.zero_grad()
-            actor_loss.backward()  # <--- Changed: Removed retain_graph=True
+            actor_loss.backward()  # Normal backward pass (No retain_graph=True memory leak)
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             self.actor_optim.step()
 
