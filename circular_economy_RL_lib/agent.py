@@ -22,7 +22,7 @@ class Actor(nn.Module):
         x = F.relu(self.layer2(x))
         x = self.layer3(x)
         
-        # Softly map the raw outputs between 0.01 and 100.0 to prevent gradient vanishing
+        # Softly map outputs between 0.01 and 100.0
         return torch.sigmoid(x) * 99.99 + 0.01
 
 class Critic(nn.Module):
