@@ -1,7 +1,7 @@
 import os
 import sys
 
-# Prevent OpenMP and MKL thread conflicts between PyTorch and TensorFlow
+# Prevent OpenMP and MKL thread-pool deadlocks
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
