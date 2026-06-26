@@ -24,7 +24,7 @@ config = {
     'RWD_SCALE': 1e-6,             
     
     # BRL Parameters (Gaur et al. 2025)
-    'lambda_penalty': 0.005,        # Stabilized penalty scaling
+    'lambda_penalty': 0.005,       # Calibrated penalty to prevent systemic shutdown
     'lr_leader': 1e-4,             # Slower leader timescale
     'lr_follower': 3e-4,           # Fast follower learning rate
     'leader_update_frequency': 5,  # Timescale separation interval
