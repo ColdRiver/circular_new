@@ -49,8 +49,7 @@ class BilevelTrainer:
             for ep_t in range(self.episode_length):
                 t += 1
                 
-                # --- Upper-Level Leader decides rules (phi) ---
-                # Step-by-step updates for mathematically valid importance ratios
+                # --- Step 1: Upper-Level Leader decides rules (phi) ---
                 batch_obs[LEADER].append(s_leader)
                 phi, log_p_leader = self.leader_agent.get_action(s_leader / 100.0)
                 batch_acts[LEADER].append(phi)
@@ -116,52 +115,64 @@ class BilevelTrainer:
         tensor_log_probs = [torch.tensor(np.array(lp), dtype=torch.float) for lp in batch_log_probs]
 
         # Evaluate GAE-Lambda returns
-        batch_rtgs, batch_rets = self.compute_rtgs(batch_obs, batch_rews)
+        batch_rtgs, batch_rets = self.compute_rtgs(batch_obs, batch_rews, batch_lens)
         return tensor_obs, tensor_acts, tensor_log_probs, batch_rtgs, batch_rets, batch_lens
 
-    def compute_rtgs(self, batch_obs, batch_rews):
+    def compute_rtgs(self, batch_obs, batch_rews, batch_lens):
         """
         Calculates GAE-Lambda advantages and value targets
         """
         batch_rtgs = [[] for _ in stages]
         batch_rets = [[] for _ in stages]
         for stage in stages:
-            ep_rtg_list = []
             ep_ret_list = []
+            flat_rtg_list = []
             
             obs_tensor = torch.tensor(np.array(batch_obs[stage]), dtype=torch.float32)
-            num_episodes, ep_len = len(batch_rews[stage]), len(batch_rews[stage][0])
+            num_episodes = len(batch_rews[stage])
             
             with torch.no_grad():
                 if stage == LEADER:
-                    V = self.leader_agent.critic(obs_tensor.view(-1, self.leader_obs_dim)).view(num_episodes, ep_len)
+                    # leader critic returns (num_total_steps, 1) -> squeeze to (num_total_steps,)
+                    V = self.leader_agent.critic(obs_tensor / 100.0).squeeze(-1)
                 elif stage == BUYER:
-                    V = torch.stack([self.buyer_agents[ag].critic(obs_tensor[:, :, ag] / 100.0).squeeze(-1) for ag in range(self.num_agents)], dim=-1)
+                    # obs_tensor has shape (num_total_steps, 3, 1908). Corrected: Slice along Dim 1 (ag)
+                    V = torch.stack([self.buyer_agents[ag].critic(obs_tensor[:, ag, :] / 100.0).squeeze(-1) for ag in range(self.num_agents)], dim=-1)
                 else:
-                    V = torch.stack([self.trans_agents[ag].critic(obs_tensor[:, :, ag] / 100.0).squeeze(-1) for ag in range(self.num_agents)], dim=-1)
+                    # obs_tensor has shape (num_total_steps, 3, 2088). Corrected: Slice along Dim 1 (ag)
+                    V = torch.stack([self.trans_agents[ag].critic(obs_tensor[:, ag, :] / 100.0).squeeze(-1) for ag in range(self.num_agents)], dim=-1)
             
             V = V.cpu().numpy()
             
+            # Split the flat value predictions along the step dimension into individual episodes
+            V_episodes = []
+            curr_idx = 0
+            for ep_len_val in batch_lens:
+                V_episodes.append(V[curr_idx:curr_idx + ep_len_val])
+                curr_idx += ep_len_val
+            
+            # Calculate GAE advantages for each episode
             for ep in range(num_episodes):
                 rews = np.array(batch_rews[stage][ep])
-                vals = V[ep]
+                vals = V_episodes[ep]
                 
                 advantages = np.zeros_like(rews)
-                gae = np.zeros_like(rews[0])
+                gae = np.zeros(rews.shape[1] if stage != LEADER else 1)
                 
-                for t in reversed(range(ep_len)):
-                    next_val = vals[t+1] if t + 1 < ep_len else np.zeros_like(rews[0])
+                for t in reversed(range(len(rews))):
+                    next_val = vals[t+1] if t + 1 < len(rews) else np.zeros_like(rews[0])
                     delta = rews[t] + self.gamma * next_val - vals[t]
                     gae = delta + self.gamma * 0.95 * gae
                     advantages[t] = gae
                 
                 rtg = advantages + vals
-                ep_rtg_list.append(rtg)
+                flat_rtg_list.extend(rtg)
                 ep_ret_list.append(rtg[0])
-            
-            flat_rtg = torch.tensor(np.array(ep_rtg_list), dtype=torch.float).reshape(-1, self.num_agents if stage != LEADER else 1)
-            batch_rtgs[stage] = flat_rtg
+                
+            # Convert flat list of step returns directly to PyTorch tensor
+            batch_rtgs[stage] = torch.tensor(np.array(flat_rtg_list), dtype=torch.float)
             batch_rets[stage] = np.mean(ep_ret_list, axis=0)
+            
         return batch_rtgs, batch_rets
 
     def learn(self):
