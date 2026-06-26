@@ -17,12 +17,11 @@ class Actor(nn.Module):
     def forward(self, x):
         if isinstance(x, np.ndarray):
             x = torch.tensor(x, dtype=torch.float32)
-
         x = F.relu(self.layer1(x))
         x = F.relu(self.layer2(x))
         x = self.layer3(x)
         
-        # Smooth sigmoid scaling to prevent gradient vanishing
+        # Smooth Sigmoid action mapping to prevent dead hard-clamped outputs
         return torch.sigmoid(x) * 99.99 + 0.01
 
 class Critic(nn.Module):
@@ -49,21 +48,25 @@ class OptimalFollowerValueEstimator(nn.Module):
         self.layer1 = nn.Linear(input_dim, hidden_dim)
         self.layer2 = nn.Linear(hidden_dim, hidden_dim)
         self.layer3 = nn.Linear(hidden_dim, 1)
-        self.optimizer = optim.Adam(self.parameters(), lr=1e-3)
+        
+        # Smooth Tanh scaling restricting estimator output to physical targets [-0.01, 0.01]
+        self.scale_layer = nn.Tanh()
+        self.optimizer = optim.Adam(self.parameters(), lr=1e-4)
 
     def forward(self, x):
         if isinstance(x, np.ndarray):
             x = torch.tensor(x, dtype=torch.float32)
         x = F.relu(self.layer1(x))
         x = F.relu(self.layer2(x))
-        return self.layer3(x)
+        x = self.layer3(x)
+        return self.scale_layer(x) * 0.01
 
     def update(self, state_phi, target_returns):
         self.optimizer.zero_grad()
         predictions = self.forward(state_phi).squeeze()
         
-        # Defensive check against redundant tracking graph operations
-        targets = target_returns.clone().detach() if isinstance(target_returns, torch.Tensor) else torch.tensor(target_returns, dtype=torch.float32)
+        # Squeeze and detach targets to isolate graph execution
+        targets = target_returns.clone().detach().squeeze() if isinstance(target_returns, torch.Tensor) else torch.tensor(target_returns, dtype=torch.float32).squeeze()
         
         loss = nn.MSELoss()(predictions, targets)
         loss.backward()
@@ -76,15 +79,21 @@ class PPOAgent:
         self.critic = Critic(n_observations, hidden_dims)
         self.actor_optim = optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_optim = optim.Adam(self.critic.parameters(), lr=lr)
-        self.cov_var = torch.full(size=(n_actions,), fill_value=0.5)
-        self.cov_mat = torch.diag(self.cov_var)
+        
+        # Learnable standard deviation log_std instead of static variables
+        self.log_std = nn.Parameter(torch.zeros(n_actions) - 0.5)
+        self.actor_optim.add_param_group({'params': self.log_std, 'lr': lr})
+        
         self.chkpt_dir = chkpt_dir
         self.clip = 0.2
-        self.max_grad_norm = 10.0
+        self.max_grad_norm = 0.5  # Strict gradient clipping for BRL stability
 
     def get_action(self, obs):
         mean = self.actor(obs)
-        dist = MultivariateNormal(mean, self.cov_mat)
+        std = torch.clamp(torch.exp(self.log_std), min=1e-3, max=10.0)
+        cov_mat = torch.diag(std ** 2)
+        
+        dist = MultivariateNormal(mean, cov_mat)
         action = dist.sample()
         log_prob = dist.log_prob(action)
         return np.maximum(action.detach().numpy(), 0.01), log_prob.detach().numpy()
@@ -92,12 +101,16 @@ class PPOAgent:
     def evaluate(self, batch_obs, batch_acts):
         V = self.critic(batch_obs).squeeze()
         mean = self.actor(batch_obs)
-        dist = MultivariateNormal(mean, self.cov_mat)
+        std = torch.clamp(torch.exp(self.log_std), min=1e-3, max=10.0)
+        cov_mat = torch.diag(std ** 2)
+        
+        dist = MultivariateNormal(mean, cov_mat)
         log_probs = dist.log_prob(batch_acts)
-        return V, log_probs
+        entropy = dist.entropy()
+        return V, log_probs, entropy
 
     def learn(self, batch_obs, batch_acts, batch_log_probs, batch_rtgs, n_itr):
-        V, _ = self.evaluate(batch_obs, batch_acts)
+        V, _, _ = self.evaluate(batch_obs, batch_acts)
         A_k = batch_rtgs - V.detach()
         A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
 
@@ -109,21 +122,20 @@ class PPOAgent:
             b_obs = batch_obs[indices]
             b_acts = batch_acts[indices]
             b_log_probs = batch_log_probs[indices]
-            
-            # Squeeze targets to shape (batch_size,) to prevent PyTorch broadcasting bugs
-            b_rtgs = batch_rtgs[indices].squeeze()
+            b_rtgs = batch_rtgs[indices].squeeze()  # Squeezed to prevent PyTorch broadcasting
             b_A_k = A_k[indices]
 
-            V, curr_log_probs = self.evaluate(b_obs, b_acts)
+            V, curr_log_probs, entropy = self.evaluate(b_obs, b_acts)
             ratios = torch.exp(curr_log_probs - b_log_probs)
             surr1 = ratios * b_A_k
             surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * b_A_k
             
-            actor_loss = (-torch.min(surr1, surr2)).mean()
+            # Incorporate an Entropy Bonus (coef = 0.01) to encourage continuous exploration
+            actor_loss = (-torch.min(surr1, surr2)).mean() - 0.01 * entropy.mean()
             critic_loss = nn.MSELoss()(V, b_rtgs)
             
             self.actor_optim.zero_grad()
-            actor_loss.backward()  # Normal backward pass (No retain_graph=True memory leak)
+            actor_loss.backward()  # Normal backward pass (Reclaims RAM)
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             self.actor_optim.step()
 
