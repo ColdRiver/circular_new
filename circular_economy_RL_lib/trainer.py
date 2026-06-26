@@ -50,6 +50,7 @@ class BilevelTrainer:
                 t += 1
                 
                 # --- Step 1: Upper-Level Leader decides rules (phi) ---
+                # Step-by-step updates for mathematically valid importance ratios
                 batch_obs[LEADER].append(s_leader)
                 phi, log_p_leader = self.leader_agent.get_action(s_leader / 100.0)
                 batch_acts[LEADER].append(phi)
@@ -157,7 +158,7 @@ class BilevelTrainer:
                 vals = V_episodes[ep]
                 
                 advantages = np.zeros_like(rews)
-                gae = np.zeros_like(rews[0])  # Corrected: Adapts automatically to scalar or vector shapes
+                gae = np.zeros_like(rews[0])  # Adapts automatically to scalar or vector shapes
                 
                 for t in reversed(range(len(rews))):
                     next_val = vals[t+1] if t + 1 < len(rews) else np.zeros_like(rews[0])
@@ -228,7 +229,7 @@ class BilevelTrainer:
                 total_penalty = torch.stack(penalties, dim=0).mean(dim=0).unsqueeze(-1).detach()
                 
                 # Soft penalty clipping
-                clamped_penalty = torch.clamp(total_penalty, min=-2.0, max=2.0)
+                clamped_penalty = torch.clamp(total_penalty, min=-10.0, max=10.0)
                 penalized_rtgs = batch_rtgs[LEADER] - self.lambda_penalty * clamped_penalty
 
                 a_loss_l, c_loss_l = self.leader_agent.learn(
