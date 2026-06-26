@@ -20,7 +20,7 @@ class BilevelTrainer:
         # Dimensional setup and validation (14, 1824, 1908, 2088)
         self.seller_obs_dim = self.num_commodities * self.history_length * (6 + self.num_agents * 8) + 2 * self.num_commodities # 1824
         self.buyer_obs_dim = self.seller_obs_dim + self.num_commodities + 2 * self.num_commodities * self.num_agents # 1908
-        self.trans_obs_dim = self.buyer_obs_dim + self.num_commodities * (4 * self.num_agents * 3) # 2088
+        self.trans_obs_dim = self.buyer_obs_dim + self.num_commodities * (4 * self.num_agents + 3) # 2088
         
         self.buyer_act_dim = 2 * self.num_commodities * (self.num_agents - 1) + self.num_commodities # 60
         self.trans_act_dim = 2 * self.num_commodities # 24
