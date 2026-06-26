@@ -55,15 +55,13 @@ class Critic(nn.Module):
 class OptimalFollowerValueEstimator(nn.Module):
     """
     Auxiliary Value Network tracking optimal follower returns V*(phi, s_lower)
+    under the active upper-level parameters (phi)
     """
     def __init__(self, input_dim, hidden_dim=128):
         super(OptimalFollowerValueEstimator, self).__init__()
         self.layer1 = nn.Linear(input_dim, hidden_dim)
         self.layer2 = nn.Linear(hidden_dim, hidden_dim)
         self.layer3 = nn.Linear(hidden_dim, 1)
-        
-        # Restrict estimator predictions to calibrated baseline target ranges [-20.0, 20.0]
-        self.scale_layer = nn.Tanh()
         self.apply(orthogonal_init)
         self.optimizer = optim.Adam(self.parameters(), lr=1e-4)
 
@@ -72,8 +70,8 @@ class OptimalFollowerValueEstimator(nn.Module):
             x = torch.tensor(x, dtype=torch.float32)
         x = F.relu(self.layer1(x))
         x = F.relu(self.layer2(x))
-        x = self.layer3(x)
-        return self.scale_layer(x) * 20.0
+        # Unbounded linear output allowing exact regression to the scaled follower returns
+        return self.layer3(x)
 
     def update(self, state_phi, target_returns):
         self.optimizer.zero_grad()
@@ -145,8 +143,8 @@ class PPOAgent:
             surr1 = ratios * b_A_k
             surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * b_A_k
             
-            # Entropy bonus (coef = 0.01) preventing premature local minima convergence
-            actor_loss = (-torch.min(surr1, surr2)).mean() - 0.01 * entropy.mean()
+            # Increased entropy bonus (coef = 0.05) to sustain active exploration under tax shifts
+            actor_loss = (-torch.min(surr1, surr2)).mean() - 0.05 * entropy.mean()
             critic_loss = nn.MSELoss()(V, b_rtgs)
             
             self.actor_optim.zero_grad()
