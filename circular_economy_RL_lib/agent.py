@@ -23,9 +23,8 @@ class Actor(nn.Module):
         self.layer2 = nn.Linear(hidden_dims, hidden_dims)
         self.layer3 = nn.Linear(hidden_dims, n_actions)
         
-        # Apply standard PPO orthogonal initialization
         self.apply(orthogonal_init)
-        orthogonal_init(self.layer3, gain=0.01)  # Small final layer scale prevents saturation
+        orthogonal_init(self.layer3, gain=0.01)
 
     def forward(self, x):
         if isinstance(x, np.ndarray):
@@ -34,7 +33,7 @@ class Actor(nn.Module):
         x = F.relu(self.layer2(x))
         x = self.layer3(x)
         
-        # Smooth Sigmoid action mapping preventing hard-clamped saturation
+        # Smooth Sigmoid action mapping preventing dead hard-clamped outputs
         return torch.sigmoid(x) * 99.99 + 0.01
 
 class Critic(nn.Module):
@@ -55,7 +54,6 @@ class Critic(nn.Module):
 class OptimalFollowerValueEstimator(nn.Module):
     """
     Auxiliary Value Network tracking optimal follower returns V*(phi, s_lower)
-    under the active upper-level parameters (phi)
     """
     def __init__(self, input_dim, hidden_dim=128):
         super(OptimalFollowerValueEstimator, self).__init__()
@@ -77,6 +75,7 @@ class OptimalFollowerValueEstimator(nn.Module):
         self.optimizer.zero_grad()
         predictions = self.forward(state_phi).squeeze()
         
+        # Squeeze and detach targets to isolate graph execution
         targets = target_returns.clone().detach().squeeze() if isinstance(target_returns, torch.Tensor) else torch.tensor(target_returns, dtype=torch.float32).squeeze()
         
         loss = nn.MSELoss()(predictions, targets)
@@ -97,7 +96,7 @@ class PPOAgent:
         
         self.chkpt_dir = chkpt_dir
         self.clip = 0.2
-        self.max_grad_norm = 0.5  # Restrictive gradient clipping for BRL stability
+        self.max_grad_norm = 0.5
 
     def get_action(self, obs):
         mean = self.actor(obs)
@@ -133,9 +132,12 @@ class PPOAgent:
             b_obs = batch_obs[indices]
             b_acts = batch_acts[indices]
             b_log_probs = batch_log_probs[indices]
+            
+            # Safe squeezing to prevent dimension broadcasting bugs
             b_rtgs = batch_rtgs[indices]
             if b_rtgs.dim() > 1 and b_rtgs.shape[-1] == 1:
-                b_rtgs = b_rtgs.squeeze(-1)  # Only squeeze the target dimension, protecting batch dimension
+                b_rtgs = b_rtgs.squeeze(-1)
+                
             b_A_k = A_k[indices]
 
             V, curr_log_probs, entropy = self.evaluate(b_obs, b_acts)
@@ -143,7 +145,7 @@ class PPOAgent:
             surr1 = ratios * b_A_k
             surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * b_A_k
             
-            # Increased entropy bonus (coef = 0.05) to sustain active exploration under tax shifts
+            # Entropy bonus (coef = 0.05) preventing premature local minima convergence
             actor_loss = (-torch.min(surr1, surr2)).mean() - 0.05 * entropy.mean()
             critic_loss = nn.MSELoss()(V, b_rtgs)
             
