@@ -135,7 +135,9 @@ class PPOAgent:
             b_obs = batch_obs[indices]
             b_acts = batch_acts[indices]
             b_log_probs = batch_log_probs[indices]
-            b_rtgs = batch_rtgs[indices].squeeze()  # Prevents dimension broadcasting bugs
+            b_rtgs = batch_rtgs[indices]
+            if b_rtgs.dim() > 1 and b_rtgs.shape[-1] == 1:
+                b_rtgs = b_rtgs.squeeze(-1)  # Only squeeze the target dimension, protecting batch dimension
             b_A_k = A_k[indices]
 
             V, curr_log_probs, entropy = self.evaluate(b_obs, b_acts)
