@@ -49,8 +49,8 @@ class BilevelTrainer:
             for ep_t in range(self.episode_length):
                 t += 1
                 
-                # --- Step 1: Upper-Level Leader decides rules (phi) at every step ---
-                # This ensures mathematically aligned transitions s_t -> a_t -> log_p_t
+                # --- Upper-Level Leader decides rules (phi) ---
+                # Step-by-step updates for mathematically valid importance ratios
                 batch_obs[LEADER].append(s_leader)
                 phi, log_p_leader = self.leader_agent.get_action(s_leader / 100.0)
                 batch_acts[LEADER].append(phi)
@@ -115,23 +115,49 @@ class BilevelTrainer:
         tensor_acts = [torch.tensor(np.array(act), dtype=torch.float) for act in batch_acts]
         tensor_log_probs = [torch.tensor(np.array(lp), dtype=torch.float) for lp in batch_log_probs]
 
-        batch_rtgs, batch_rets = self.compute_rtgs(batch_rews)
+        # Evaluate GAE-Lambda returns
+        batch_rtgs, batch_rets = self.compute_rtgs(batch_obs, batch_rews)
         return tensor_obs, tensor_acts, tensor_log_probs, batch_rtgs, batch_rets, batch_lens
 
-    def compute_rtgs(self, batch_rews):
+    def compute_rtgs(self, batch_obs, batch_rews):
+        """
+        Calculates GAE-Lambda advantages and value targets
+        """
         batch_rtgs = [[] for _ in stages]
         batch_rets = [[] for _ in stages]
         for stage in stages:
             ep_rtg_list = []
             ep_ret_list = []
-            for ep_rews in reversed(batch_rews[stage]):
-                discounted_reward = np.zeros_like(ep_rews[0])
-                ep_rtg = []
-                for rew in reversed(ep_rews):
-                    discounted_reward = rew + discounted_reward * self.gamma
-                    ep_rtg.insert(0, discounted_reward)
-                ep_rtg_list.append(ep_rtg)
-                ep_ret_list.append(ep_rtg[0])
+            
+            obs_tensor = torch.tensor(np.array(batch_obs[stage]), dtype=torch.float32)
+            num_episodes, ep_len = len(batch_rews[stage]), len(batch_rews[stage][0])
+            
+            with torch.no_grad():
+                if stage == LEADER:
+                    V = self.leader_agent.critic(obs_tensor.view(-1, self.leader_obs_dim)).view(num_episodes, ep_len)
+                elif stage == BUYER:
+                    V = torch.stack([self.buyer_agents[ag].critic(obs_tensor[:, :, ag] / 100.0).squeeze(-1) for ag in range(self.num_agents)], dim=-1)
+                else:
+                    V = torch.stack([self.trans_agents[ag].critic(obs_tensor[:, :, ag] / 100.0).squeeze(-1) for ag in range(self.num_agents)], dim=-1)
+            
+            V = V.cpu().numpy()
+            
+            for ep in range(num_episodes):
+                rews = np.array(batch_rews[stage][ep])
+                vals = V[ep]
+                
+                advantages = np.zeros_like(rews)
+                gae = np.zeros_like(rews[0])
+                
+                for t in reversed(range(ep_len)):
+                    next_val = vals[t+1] if t + 1 < ep_len else np.zeros_like(rews[0])
+                    delta = rews[t] + self.gamma * next_val - vals[t]
+                    gae = delta + self.gamma * 0.95 * gae
+                    advantages[t] = gae
+                
+                rtg = advantages + vals
+                ep_rtg_list.append(rtg)
+                ep_ret_list.append(rtg[0])
             
             flat_rtg = torch.tensor(np.array(ep_rtg_list), dtype=torch.float).reshape(-1, self.num_agents if stage != LEADER else 1)
             batch_rtgs[stage] = flat_rtg
@@ -148,7 +174,7 @@ class BilevelTrainer:
             t_so_far += np.sum(batch_lens)
             i_so_far += 1
 
-            # --- Update Lower-Level Follower Policies (theta) ---
+            # --- Update Lower-Level Follower Policies ---
             for ag in range(self.num_agents):
                 # Update Buyer Agents
                 a_loss_b, c_loss_b = self.buyer_agents[ag].learn(
@@ -176,7 +202,7 @@ class BilevelTrainer:
                 loss_est = self.best_response_estimator.update(estimator_input, target_returns)
                 self.writer.add_scalar(f'best_response_est_loss_agent_{ag}', loss_est, t_so_far)
 
-            # --- Update Upper-Level Leader Policy (phi) ---
+            # --- Update Upper-Level Leader Policy ---
             if i_so_far % self.leader_update_frequency == 0:
                 penalties = []
                 for ag in range(self.num_agents):
@@ -190,8 +216,8 @@ class BilevelTrainer:
                 
                 total_penalty = torch.stack(penalties, dim=0).mean(dim=0).unsqueeze(-1).detach()
                 
-                # Soft penalty clipping to prevent uncalibrated predictions from causing gradient blowup
-                clamped_penalty = torch.clamp(total_penalty, min=-0.01, max=0.01)
+                # Soft penalty clipping
+                clamped_penalty = torch.clamp(total_penalty, min=-2.0, max=2.0)
                 penalized_rtgs = batch_rtgs[LEADER] - self.lambda_penalty * clamped_penalty
 
                 a_loss_l, c_loss_l = self.leader_agent.learn(
@@ -201,7 +227,6 @@ class BilevelTrainer:
                 self.writer.add_scalar('leader_actor_loss', a_loss_l, t_so_far)
                 self.writer.add_scalar('leader_critic_loss', c_loss_l, t_so_far)
                 
-                # Evict unused PyTorch autograd graph memory from the GPU
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
