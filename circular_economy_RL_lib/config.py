@@ -20,7 +20,7 @@ config = {
     'UC': 0.5,
     'TX_P': 0.5,
     'INIT_INV': 100,
-    'RWD_SCALE': 1e-9,
+    'RWD_SCALE': 1e-5,
     
     # Bilevel Reinforcement Learning (BRL) Hyperparameters (Gaur et al. 2025)
     'lambda_penalty': 0.05,        # Calibrated penalty scale to prevent objective dominance
