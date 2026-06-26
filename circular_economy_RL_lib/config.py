@@ -1,7 +1,6 @@
 import numpy as np
-from dataclasses import dataclass
 
-## Settings for the stages (Leader acts first, then Followers sequence)
+## Settings for the stages
 LEADER = 0
 BUYER = 1
 TRANSFORM = 2
@@ -20,17 +19,19 @@ config = {
     'UC': 0.5,
     'TX_P': 0.5,
     'INIT_INV': 100,
-    'RWD_SCALE': 1e-5,
     
-    # Bilevel Reinforcement Learning (BRL) Hyperparameters (Gaur et al. 2025)
-    'lambda_penalty': 0.05,        # Calibrated penalty scale to prevent objective dominance
+    # Calibrated Reward Scaling (Prevents Gradient Underflow)
+    'RWD_SCALE': 1e-6,             
+    
+    # BRL Parameters (Gaur et al. 2025)
+    'lambda_penalty': 0.05,        # Stabilized penalty scaling
     'lr_leader': 1e-4,             # Slower leader timescale
     'lr_follower': 3e-4,           # Fast follower learning rate
-    'leader_update_frequency': 5,  # Alternating epoch timescale ratio
+    'leader_update_frequency': 5,  # Timescale separation interval
     
     # Training parameters
     'gamma': 0.99,
-    'num_steps': 1000,             # Steps per epoch
+    'num_steps': 1000,             
     'episode_length': 1000,
     'num_epochs': 100,
     'history_length': 5,
