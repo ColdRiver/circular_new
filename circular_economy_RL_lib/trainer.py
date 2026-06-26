@@ -46,20 +46,22 @@ class BilevelTrainer:
             s_leader, s_follower = self.env.reset()
             done = False
             
-            # --- Strategic Timescale Separation ---
-            # Leader decides rules (phi) once per episode, keeping market stable
-            phi, log_p_leader = self.leader_agent.get_action(s_leader / 100.0)
-            s_follower = self.env.step_sell(phi)
-            s_buyer = self.env.get_buyer_state(s_follower)
-            
             for ep_t in range(self.episode_length):
                 t += 1
                 
-                # Append leader variables (kept constant for the episode)
+                # --- Step 1: Upper-Level Leader decides rules (phi) at every step ---
+                # This ensures mathematically aligned transitions s_t -> a_t -> log_p_t
                 batch_obs[LEADER].append(s_leader)
+                phi, log_p_leader = self.leader_agent.get_action(s_leader / 100.0)
                 batch_acts[LEADER].append(phi)
                 batch_log_probs[LEADER].append(log_p_leader)
                 
+                # Update follower environment with regulatory state
+                s_follower = self.env.step_sell(phi)
+
+                # Reconstruct step 2 buyer states (1908 dimensions)
+                s_buyer = self.env.get_buyer_state(s_follower)
+
                 # --- Step 2: Followers decide trading quantities ---
                 batch_obs[BUYER].append(s_buyer)
                 buyer_actions = []
@@ -75,6 +77,8 @@ class BilevelTrainer:
 
                 # Step the buying environment
                 rew_b = self.env.step_buy(buyer_actions)
+
+                # Reconstruct step 3 transformer states (2088 dimensions)
                 s_trans = self.env.get_trans_state(s_buyer)
 
                 # --- Step 3: Followers decide transformation/utility ---
@@ -97,10 +101,8 @@ class BilevelTrainer:
                 ep_rews[BUYER].append(rew_b)
                 ep_rews[TRANSFORM].append(rew_t)
 
-                # Recalculate states under the active leader rules
                 s_leader = s_leader_next
                 s_follower = s_follower_next
-                s_buyer = self.env.get_buyer_state(s_follower)
 
                 if done:
                     break
@@ -113,7 +115,6 @@ class BilevelTrainer:
         tensor_acts = [torch.tensor(np.array(act), dtype=torch.float) for act in batch_acts]
         tensor_log_probs = [torch.tensor(np.array(lp), dtype=torch.float) for lp in batch_log_probs]
 
-        # Evaluate returns using standard GAE-Lambda formulation
         batch_rtgs, batch_rets = self.compute_rtgs(batch_rews)
         return tensor_obs, tensor_acts, tensor_log_probs, batch_rtgs, batch_rets, batch_lens
 
