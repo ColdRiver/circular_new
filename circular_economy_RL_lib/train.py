@@ -1,17 +1,13 @@
-import sys
-import os
-import multiprocessing
-from trainer import BilevelTrainer
-from utils import create_logger
 import os
 import sys
 
-# Prevent OpenMP and MKL thread-pool deadlocks between PyTorch and TensorFlow
+# Prevent OpenMP and MKL thread conflicts between PyTorch and TensorFlow
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
-# Ensure PYTHONPATH handles local modules correctly
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import multiprocessing
+from utils import create_logger
+from trainer import BilevelTrainer
 
 logger_params = {
     'log_file': {
