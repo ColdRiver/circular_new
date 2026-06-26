@@ -4,9 +4,9 @@ from surrogate_models import SurrogateModel
 
 class Manufacturing_Simulator:
     """
-    Bilevel Environment Class
+    Bilevel Environment Class with Temporal Price Inertia
     -- reset: returns the global leader state and decentralized follower states
-    -- step_sell: receives upper-level action phi and establishes collective market rules
+    -- step_sell: receives raw phi, filters it via a low-pass filter, and establishes prices
     -- get_buyer_state: constructs the 1908-dimension state vector for step 2 buyers
     -- step_buy: computes P2P transactions and returns follower rewards
     -- get_trans_state: constructs the 2088-dimension state vector for step 3 transformers
@@ -19,8 +19,9 @@ class Manufacturing_Simulator:
         
     def reset(self):
         self.t = self.history_length
-        data_length = self.history_length + self.episode_length + 1
+        self.active_phi = None  # Reset the low-pass filter for the new episode
         
+        data_length = self.history_length + self.episode_length + 1
         general_shape = (self.num_commodities, data_length)
         individual_shape = (self.num_agents, self.num_commodities, data_length)
         pair_shape = (self.num_agents, self.num_agents, self.num_commodities, data_length)
@@ -59,18 +60,12 @@ class Manufacturing_Simulator:
         return self.get_leader_state(), self.get_follower_state()
     
     def get_leader_state(self):
-        """
-        Upper-level state reflecting macro-environmental performance (14 dimensions)
-        """
         avg_spot = np.mean(self.spot_price[:, self.t-self.history_length:self.t], axis=1)
         total_waste_landfilled = np.sum(self.spot_q[:, :, self.t-1]) if self.t > self.history_length else 0.
         total_freshwater = np.sum(self.inv[:, 0, self.t])
         return np.concatenate((avg_spot, [total_waste_landfilled, total_freshwater]))
 
     def get_follower_state(self):
-        """
-        Decentralized follower state tracking localized inventories and physical dynamics (1824 dimensions)
-        """
         follower_states = []
         start_time = self.t - self.history_length
         for n in range(self.num_agents):
@@ -101,9 +96,6 @@ class Manufacturing_Simulator:
         return np.array(follower_states)
 
     def get_buyer_state(self, s_follower):
-        """
-        Constructs the 1908-dimension state vector for step 2 buyers
-        """
         buyer_states = []
         for n in range(self.num_agents):
             state_flat = s_follower[n]
@@ -117,21 +109,15 @@ class Manufacturing_Simulator:
         return np.array(buyer_states)
 
     def get_trans_state(self, s_buyer):
-        """
-        Constructs the 2088-dimension state vector for step 3 transformers
-        Slices all transaction arrays strictly at the current simulation round self.t
-        """
         trans_states = []
         for n in range(self.num_agents):
             state_flat = s_buyer[n]
             
-            # Sliced current step buyer decisions (total size 84)
             q_flat = self.q[n, :, :, self.t].flatten()               
             waste_q_flat = self.waste_q[n, :, :, self.t].flatten()   
             spot_q_flat = self.spot_q[n, :, self.t].flatten()     
             state_flat = np.concatenate([state_flat, q_flat, waste_q_flat, spot_q_flat])
             
-            # Sliced current step physical responses (total size 96)
             actual_d_flat = self.actual_d[n, :, :, self.t].flatten()             
             waste_actual_d_flat = self.waste_actual_d[n, :, :, self.t].flatten() 
             inv_buy_flat = self.inv_buy[n, :, self.t].flatten()               
@@ -144,20 +130,24 @@ class Manufacturing_Simulator:
     def step_sell(self, orig_leader_action):
         """
         Phase 1: Upper-Level Leader sets baseline pricing constraints (phi)
+        Filters raw actions via a low-pass filter (alpha = 0.05) to maintain follower stability
         """
-        phi = np.clip(orig_leader_action, 0.1, 10.0)
-        self.active_phi = phi
+        raw_phi = np.clip(orig_leader_action, 0.1, 10.0)
+        
+        # Low-pass filter (Exponential Moving Average)
+        alpha_smooth = 0.05
+        if self.active_phi is None:
+            self.active_phi = raw_phi
+        else:
+            self.active_phi = (1.0 - alpha_smooth) * self.active_phi + alpha_smooth * raw_phi
         
         for n in range(self.num_agents):
-            self.price[n, :, self.t] = phi[0] * self.spot_price[:, self.t]
+            self.price[n, :, self.t] = self.active_phi[0] * self.spot_price[:, self.t]
             self.waste_price[n, :, self.t] = 0.5 * self.price[n, :, self.t]
             
         return self.get_follower_state()
 
     def step_buy(self, orig_buyer_actions):
-        """
-        Phase 2: Followers execute buying actions under active market rules (phi)
-        """
         keys = ['q', 'waste_q', 'spot_q']
         nc = (self.num_agents - 1) * self.num_commodities
         lengths = [nc, nc, self.num_commodities]
@@ -213,9 +203,6 @@ class Manufacturing_Simulator:
         return np.array(buyer_rewards)
 
     def step_trans(self, orig_trans_actions):
-        """
-        Phase 3: Followers execute manufacturing & transformation steps
-        """
         keys = ['tx_u', 'eco_u']
         key_len_dict = {k: self.num_commodities for k in keys}
         
