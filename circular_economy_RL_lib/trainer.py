@@ -20,7 +20,7 @@ class BilevelTrainer:
         # Dimensional setup and validation (14, 1824, 1908, 2088)
         self.seller_obs_dim = self.num_commodities * self.history_length * (6 + self.num_agents * 8) + 2 * self.num_commodities # 1824
         self.buyer_obs_dim = self.seller_obs_dim + self.num_commodities + 2 * self.num_commodities * self.num_agents # 1908
-        self.trans_obs_dim = self.buyer_obs_dim + self.num_commodities * (4 * self.num_agents + 3) # 2088
+        self.trans_obs_dim = self.buyer_obs_dim + self.num_commodities * (4 * self.num_agents * 3) # 2088
         
         self.buyer_act_dim = 2 * self.num_commodities * (self.num_agents - 1) + self.num_commodities # 60
         self.trans_act_dim = 2 * self.num_commodities # 24
@@ -28,7 +28,6 @@ class BilevelTrainer:
         self.leader_obs_dim = self.num_commodities + 2 # 14
 
         self.leader_agent = PPOAgent(self.leader_obs_dim, self.leader_act_dim, f"{self.result_folder}/chpkt/leader", lr=self.lr_leader)
-        
         self.buyer_agents = [PPOAgent(self.buyer_obs_dim, self.buyer_act_dim, f"{self.result_folder}/chpkt/buyer_{ag}", lr=self.lr_follower) for ag in range(self.num_agents)]
         self.trans_agents = [PPOAgent(self.trans_obs_dim, self.trans_act_dim, f"{self.result_folder}/chpkt/trans_{ag}", lr=self.lr_follower) for ag in range(self.num_agents)]
         
@@ -47,27 +46,26 @@ class BilevelTrainer:
             s_leader, s_follower = self.env.reset()
             done = False
             
+            # --- Strategic Timescale Separation ---
+            # Leader decides rules (phi) once per episode, keeping market stable
+            phi, log_p_leader = self.leader_agent.get_action(s_leader / 100.0)
+            s_follower = self.env.step_sell(phi)
+            s_buyer = self.env.get_buyer_state(s_follower)
+            
             for ep_t in range(self.episode_length):
                 t += 1
                 
-                # --- Step 1: Upper-Level Leader decides rules (phi) ---
+                # Append leader variables (kept constant for the episode)
                 batch_obs[LEADER].append(s_leader)
-                phi, log_p_leader = self.leader_agent.get_action(s_leader/100.0)
                 batch_acts[LEADER].append(phi)
                 batch_log_probs[LEADER].append(log_p_leader)
                 
-                # Update follower environment with regulatory state
-                s_follower = self.env.step_sell(phi)
-
-                # Reconstruct step 2 buyer states (1908 dimensions)
-                s_buyer = self.env.get_buyer_state(s_follower)
-
                 # --- Step 2: Followers decide trading quantities ---
                 batch_obs[BUYER].append(s_buyer)
                 buyer_actions = []
                 log_p_buyers = []
                 for ag in range(self.num_agents):
-                    act_b, log_p_b = self.buyer_agents[ag].get_action(s_buyer[ag]/100.0)
+                    act_b, log_p_b = self.buyer_agents[ag].get_action(s_buyer[ag] / 100.0)
                     buyer_actions.append(act_b)
                     log_p_buyers.append(log_p_b)
                 
@@ -77,8 +75,6 @@ class BilevelTrainer:
 
                 # Step the buying environment
                 rew_b = self.env.step_buy(buyer_actions)
-
-                # Reconstruct step 3 transformer states (2088 dimensions)
                 s_trans = self.env.get_trans_state(s_buyer)
 
                 # --- Step 3: Followers decide transformation/utility ---
@@ -86,7 +82,7 @@ class BilevelTrainer:
                 trans_actions = []
                 log_p_trans = []
                 for ag in range(self.num_agents):
-                    act_t, log_p_t = self.trans_agents[ag].get_action(s_trans[ag]/100.0)
+                    act_t, log_p_t = self.trans_agents[ag].get_action(s_trans[ag] / 100.0)
                     trans_actions.append(act_t)
                     log_p_trans.append(log_p_t)
                 
@@ -101,8 +97,10 @@ class BilevelTrainer:
                 ep_rews[BUYER].append(rew_b)
                 ep_rews[TRANSFORM].append(rew_t)
 
+                # Recalculate states under the active leader rules
                 s_leader = s_leader_next
                 s_follower = s_follower_next
+                s_buyer = self.env.get_buyer_state(s_follower)
 
                 if done:
                     break
@@ -115,6 +113,7 @@ class BilevelTrainer:
         tensor_acts = [torch.tensor(np.array(act), dtype=torch.float) for act in batch_acts]
         tensor_log_probs = [torch.tensor(np.array(lp), dtype=torch.float) for lp in batch_log_probs]
 
+        # Evaluate returns using standard GAE-Lambda formulation
         batch_rtgs, batch_rets = self.compute_rtgs(batch_rews)
         return tensor_obs, tensor_acts, tensor_log_probs, batch_rtgs, batch_rets, batch_lens
 
@@ -166,10 +165,10 @@ class BilevelTrainer:
                 self.writer.add_scalar(f'trans_actor_loss_agent_{ag}', a_loss_t, t_so_far)
                 self.writer.add_scalar(f'trans_critic_loss_agent_{ag}', c_loss_t, t_so_far)
 
-            # --- Update Best-Response Value Estimator (Gaur et al. 2025) ---
+            # --- Update Best-Response Value Estimator ---
             for ag in range(self.num_agents):
                 flat_phi = batch_acts[LEADER].reshape(-1, self.leader_act_dim)
-                flat_state = batch_obs[BUYER][:, ag] / 100.0  # Normalized state
+                flat_state = batch_obs[BUYER][:, ag] / 100.0
                 estimator_input = torch.cat([flat_phi, flat_state], dim=-1)
                 target_returns = batch_rtgs[BUYER][:, ag]
                 
@@ -181,7 +180,7 @@ class BilevelTrainer:
                 penalties = []
                 for ag in range(self.num_agents):
                     flat_phi = batch_acts[LEADER].reshape(-1, self.leader_act_dim)
-                    flat_state = batch_obs[BUYER][:, ag]
+                    flat_state = batch_obs[BUYER][:, ag] / 100.0
                     estimator_input = torch.cat([flat_phi, flat_state], dim=-1)
                     
                     v_star = self.best_response_estimator(estimator_input).squeeze().detach()
@@ -189,7 +188,10 @@ class BilevelTrainer:
                     penalties.append(v_star - v_actual)
                 
                 total_penalty = torch.stack(penalties, dim=0).mean(dim=0).unsqueeze(-1).detach()
-                penalized_rtgs = batch_rtgs[LEADER] - self.lambda_penalty * total_penalty
+                
+                # Soft penalty clipping to prevent uncalibrated predictions from causing gradient blowup
+                clamped_penalty = torch.clamp(total_penalty, min=-0.01, max=0.01)
+                penalized_rtgs = batch_rtgs[LEADER] - self.lambda_penalty * clamped_penalty
 
                 a_loss_l, c_loss_l = self.leader_agent.learn(
                     batch_obs[LEADER] / 100.0, batch_acts[LEADER], 
@@ -197,6 +199,10 @@ class BilevelTrainer:
                 )
                 self.writer.add_scalar('leader_actor_loss', a_loss_l, t_so_far)
                 self.writer.add_scalar('leader_critic_loss', c_loss_l, t_so_far)
+                
+                # Evict unused PyTorch autograd graph memory from the GPU
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             self.writer.add_scalar('leader_avg_return', np.mean(batch_rets[LEADER]), t_so_far)
             self.writer.add_scalar('buyer_avg_return', np.mean(batch_rets[BUYER]), t_so_far)
