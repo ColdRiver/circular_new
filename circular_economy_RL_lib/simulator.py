@@ -120,11 +120,12 @@ class Manufacturing_Simulator:
 
     def step_sell(self, orig_leader_action):
         """
-        Phase 1: Leader sets market rules (phi)
-        Uses an Exponential Moving Average (alpha=0.05) to filter daily fluctuations
+        Phase 1: Upper-Level Leader sets baseline pricing constraints (phi)
+        Filters raw actions via a low-pass filter (alpha = 0.05) to maintain follower stability
         """
         raw_phi = np.clip(orig_leader_action, 0.1, 10.0)
         
+        # Low-pass filter (Exponential Moving Average)
         alpha_smooth = 0.05
         if self.active_phi is None:
             self.active_phi = raw_phi
