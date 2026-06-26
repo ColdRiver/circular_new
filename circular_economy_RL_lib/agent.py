@@ -7,12 +7,25 @@ import torch.optim as optim
 from torch.distributions import MultivariateNormal
 from config import stages
 
+def orthogonal_init(module, gain=nn.init.calculate_gain('relu')):
+    """
+    Stabilizes initial PPO policy gradients using Orthogonal initialization.
+    """
+    if isinstance(module, nn.Linear):
+        nn.init.orthogonal_(module.weight, gain=gain)
+        if module.bias is not None:
+            nn.init.constant_(module.bias, 0.0)
+
 class Actor(nn.Module):
     def __init__(self, n_observations, n_actions, hidden_dims=128):
         super(Actor, self).__init__()
         self.layer1 = nn.Linear(n_observations, hidden_dims)
         self.layer2 = nn.Linear(hidden_dims, hidden_dims)
         self.layer3 = nn.Linear(hidden_dims, n_actions)
+        
+        # Apply standard PPO orthogonal initialization
+        self.apply(orthogonal_init)
+        orthogonal_init(self.layer3, gain=0.01)  # Small final layer scale prevents saturation
 
     def forward(self, x):
         if isinstance(x, np.ndarray):
@@ -21,7 +34,7 @@ class Actor(nn.Module):
         x = F.relu(self.layer2(x))
         x = self.layer3(x)
         
-        # Smooth Sigmoid action mapping to prevent dead hard-clamped outputs
+        # Smooth Sigmoid action mapping preventing hard-clamped saturation
         return torch.sigmoid(x) * 99.99 + 0.01
 
 class Critic(nn.Module):
@@ -30,6 +43,7 @@ class Critic(nn.Module):
         self.layer1 = nn.Linear(n_observations, hidden_dims)
         self.layer2 = nn.Linear(hidden_dims, hidden_dims)
         self.layer3 = nn.Linear(hidden_dims, 1)
+        self.apply(orthogonal_init)
 
     def forward(self, x):
         if isinstance(x, np.ndarray):
@@ -41,7 +55,6 @@ class Critic(nn.Module):
 class OptimalFollowerValueEstimator(nn.Module):
     """
     Auxiliary Value Network tracking optimal follower returns V*(phi, s_lower)
-    under the active upper-level parameters (phi)
     """
     def __init__(self, input_dim, hidden_dim=128):
         super(OptimalFollowerValueEstimator, self).__init__()
@@ -49,8 +62,9 @@ class OptimalFollowerValueEstimator(nn.Module):
         self.layer2 = nn.Linear(hidden_dim, hidden_dim)
         self.layer3 = nn.Linear(hidden_dim, 1)
         
-        # Smooth Tanh scaling restricting estimator output to physical targets [-0.01, 0.01]
+        # Restrict estimator predictions to calibrated baseline target ranges [-20.0, 20.0]
         self.scale_layer = nn.Tanh()
+        self.apply(orthogonal_init)
         self.optimizer = optim.Adam(self.parameters(), lr=1e-4)
 
     def forward(self, x):
@@ -59,13 +73,12 @@ class OptimalFollowerValueEstimator(nn.Module):
         x = F.relu(self.layer1(x))
         x = F.relu(self.layer2(x))
         x = self.layer3(x)
-        return self.scale_layer(x) * 0.01
+        return self.scale_layer(x) * 20.0
 
     def update(self, state_phi, target_returns):
         self.optimizer.zero_grad()
         predictions = self.forward(state_phi).squeeze()
         
-        # Squeeze and detach targets to isolate graph execution
         targets = target_returns.clone().detach().squeeze() if isinstance(target_returns, torch.Tensor) else torch.tensor(target_returns, dtype=torch.float32).squeeze()
         
         loss = nn.MSELoss()(predictions, targets)
@@ -80,13 +93,13 @@ class PPOAgent:
         self.actor_optim = optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_optim = optim.Adam(self.critic.parameters(), lr=lr)
         
-        # Learnable standard deviation log_std instead of static variables
+        # Learnable standard deviation parameter allowing variance decay as confidence rises
         self.log_std = nn.Parameter(torch.zeros(n_actions) - 0.5)
         self.actor_optim.add_param_group({'params': self.log_std, 'lr': lr})
         
         self.chkpt_dir = chkpt_dir
         self.clip = 0.2
-        self.max_grad_norm = 0.5  # Strict gradient clipping for BRL stability
+        self.max_grad_norm = 0.5  # Restrictive gradient clipping for BRL stability
 
     def get_action(self, obs):
         mean = self.actor(obs)
@@ -122,7 +135,7 @@ class PPOAgent:
             b_obs = batch_obs[indices]
             b_acts = batch_acts[indices]
             b_log_probs = batch_log_probs[indices]
-            b_rtgs = batch_rtgs[indices].squeeze()  # Squeezed to prevent PyTorch broadcasting
+            b_rtgs = batch_rtgs[indices].squeeze()  # Prevents dimension broadcasting bugs
             b_A_k = A_k[indices]
 
             V, curr_log_probs, entropy = self.evaluate(b_obs, b_acts)
@@ -130,12 +143,12 @@ class PPOAgent:
             surr1 = ratios * b_A_k
             surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * b_A_k
             
-            # Incorporate an Entropy Bonus (coef = 0.01) to encourage continuous exploration
+            # Entropy bonus (coef = 0.01) preventing premature local minima convergence
             actor_loss = (-torch.min(surr1, surr2)).mean() - 0.01 * entropy.mean()
             critic_loss = nn.MSELoss()(V, b_rtgs)
             
             self.actor_optim.zero_grad()
-            actor_loss.backward()  # Normal backward pass (Reclaims RAM)
+            actor_loss.backward()  # Normal backward pass releasing activation graphs
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             self.actor_optim.step()
 
