@@ -3,15 +3,6 @@ from config import config, init_historical_data
 from surrogate_models import SurrogateModel
 
 class Manufacturing_Simulator:
-    """
-    Bilevel Environment Class with Temporal Price Inertia
-    -- reset: returns the global leader state and decentralized follower states
-    -- step_sell: receives raw phi, filters it via a low-pass filter, and establishes prices
-    -- get_buyer_state: constructs the 1908-dimension state vector for step 2 buyers
-    -- step_buy: computes P2P transactions and returns follower rewards
-    -- get_trans_state: constructs the 2088-dimension state vector for step 3 transformers
-    -- step_trans: evaluates non-linear surrogate networks and transitions inventories
-    """
     def __init__(self):
         for key, value in config.items():
             setattr(self, key, value)
@@ -19,7 +10,7 @@ class Manufacturing_Simulator:
         
     def reset(self):
         self.t = self.history_length
-        self.active_phi = None  # Reset the low-pass filter for the new episode
+        self.active_phi = None  # Reset the price smoothing filter for the episode
         
         data_length = self.history_length + self.episode_length + 1
         general_shape = (self.num_commodities, data_length)
@@ -129,12 +120,11 @@ class Manufacturing_Simulator:
 
     def step_sell(self, orig_leader_action):
         """
-        Phase 1: Upper-Level Leader sets baseline pricing constraints (phi)
-        Filters raw actions via a low-pass filter (alpha = 0.05) to maintain follower stability
+        Phase 1: Leader sets market rules (phi)
+        Uses an Exponential Moving Average (alpha=0.05) to filter daily fluctuations
         """
         raw_phi = np.clip(orig_leader_action, 0.1, 10.0)
         
-        # Low-pass filter (Exponential Moving Average)
         alpha_smooth = 0.05
         if self.active_phi is None:
             self.active_phi = raw_phi
