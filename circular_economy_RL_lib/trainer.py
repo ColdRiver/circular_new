@@ -157,7 +157,7 @@ class BilevelTrainer:
                 vals = V_episodes[ep]
                 
                 advantages = np.zeros_like(rews)
-                gae = np.zeros(rews.shape[1] if stage != LEADER else 1)
+                gae = np.zeros_like(rews[0])  # Corrected: Adapts automatically to scalar or vector shapes
                 
                 for t in reversed(range(len(rews))):
                     next_val = vals[t+1] if t + 1 < len(rews) else np.zeros_like(rews[0])
