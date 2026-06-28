@@ -204,27 +204,92 @@ class BilevelTrainer:
         while i_so_far < self.num_epochs:
             batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens = self.rollout()
             # =================================================================
-            # LEADER REGULATORY ACTION-CLAMPING DIAGNOSTIC SCRIPT
+            # SYSTEMIC BRL GRADIENT, SCALE & PHYSICAL FLOW DIAGNOSTIC BLOCK
             # =================================================================
-            print("\n" + "="*60)
-            print("          BRL LEADER ACTION SPREAD & CLIPPING ANALYSIS")
-            print("="*60)
+            print("\n" + "="*70)
+            print("          BRL DEEP STABILITY & GRADIENT AUDIT (EPOCH {})".format(i_so_far + 1))
+            print("="*70)
+    
+            # 1. Timescale Separation & Return Scaling
+            print("Rollout Unpenalized Returns (Averages):")
+            print(f"  Leader Stage    : {np.mean(batch_rets[LEADER]):.5f}")
+            print(f"  Buyer Stage     : {np.mean(batch_rets[BUYER], axis=0)}")
+            print(f"  Transform Stage : {np.mean(batch_rets[TRANSFORM], axis=0)}")
+    
+            # 2. Follower Action Saturation & Exploration Decay Analysis
             with torch.no_grad():
-                obs_tensor = batch_obs[LEADER]
-                # Evaluate the raw, un-clipped outputs of the leader actor network
-                mean_phi = self.leader_agent.actor(obs_tensor / 100.0)
+                leader_std = torch.exp(self.leader_agent.log_std).cpu().numpy()
+                buyer_stds = [torch.exp(self.buyer_agents[ag].log_std).cpu().numpy() for ag in range(self.num_agents)]
+                trans_stds = [torch.exp(self.trans_agents[ag].log_std).cpu().numpy() for ag in range(self.num_agents)]
                 
-                print("Leader Raw Network Outputs:")
-                print(f"  Price Multiplier (phi_0) - Min: {mean_phi[:, 0].min():.4f} | Max: {mean_phi[:, 0].max():.4f} | Mean: {mean_phi[:, 0].mean():.4f}")
-                print(f"  Recycle Subsidy  (phi_1) - Min: {mean_phi[:, 1].min():.4f} | Max: {mean_phi[:, 1].max():.4f} | Mean: {mean_phi[:, 1].mean():.4f}")
-                print(f"  Landfill Tax     (phi_2) - Min: {mean_phi[:, 2].min():.4f} | Max: {mean_phi[:, 2].max():.4f} | Mean: {mean_phi[:, 2].mean():.4f}")
+                print("\nExploration Noise (Policy Standard Deviations):")
+                print(f"  Leader std      : {leader_std}")
+                for ag in range(self.num_agents):
+                    print(f"  Buyer Agent {ag} std (Mean/Min/Max): {buyer_stds[ag].mean():.4f} / {buyer_stds[ag].min():.4f} / {buyer_stds[ag].max():.4f}")
+                    print(f"  Trans Agent {ag} std (Mean/Min/Max): {trans_stds[ag].mean():.4f} / {trans_stds[ag].min():.4f} / {trans_stds[ag].max():.4f}")
+    
+                # Check action clipping limits (fraction of steps pinned to bounds)
+                flat_buyer_acts = batch_acts[BUYER].cpu().numpy().reshape(-1, self.buyer_act_dim)
+                flat_trans_acts = batch_acts[TRANSFORM].cpu().numpy().reshape(-1, self.trans_act_dim)
                 
-                # Calculate the percentage of steps where the leader's output is out of bounds
-                clipping_threshold = 10.0
-                clipped_pct = (mean_phi >= clipping_threshold).float().mean(dim=0) * 100.0
-                print(f"\nPercentage of actions trapped in the flat plateau (>= 10.0):")
-                print(f"  phi_0: {clipped_pct[0].item():.2f}% | phi_1: {clipped_pct[1].item():.2f}% | phi_2: {clipped_pct[2].item():.2f}%")
-            print("="*60 + "\n")
+                buyer_lower_pinned = (flat_buyer_acts <= 0.015).mean() * 100.0
+                buyer_upper_pinned = (flat_buyer_acts >= 99.9).mean() * 100.0
+                trans_lower_pinned = (flat_trans_acts <= 0.015).mean() * 100.0
+                trans_upper_pinned = (flat_trans_acts >= 99.9).mean() * 100.0
+                
+                print("\nAction Boundary Saturation Analysis (Percentage Pinned to Bounds):")
+                print(f"  Buyer Actions     - Pinned to 0.01: {buyer_lower_pinned:.2f}% | Pinned to 100.0: {buyer_upper_pinned:.2f}%")
+                print(f"  Transform Actions - Pinned to 0.01: {trans_lower_pinned:.2f}% | Pinned to 100.0: {trans_upper_pinned:.2f}%")
+    
+            # 3. Advantage Scale Mismatch & Suppression Check
+            with torch.no_grad():
+                obs_tensor = batch_obs[BUYER]
+                V = torch.stack([
+                    self.buyer_agents[ag].critic(obs_tensor[:, ag, :] / 100.0).squeeze(-1) 
+                    for ag in range(self.num_agents)
+                ], dim=-1)
+                
+                A_k = batch_rtgs[BUYER] - V
+                global_std = A_k.std().item()
+                
+                print("\nAdvantage Scaling & Suppression (BUYER stage):")
+                print(f"  Global Advantage Standard Deviation: {global_std:.5f}")
+                for ag in range(self.num_agents):
+                    local_std = A_k[:, ag].std().item()
+                    suppression_ratio = local_std / (global_std + 1e-10)
+                    print(f"  Agent {ag} - Local Std: {local_std:.5f} | Suppression Ratio (Local / Global): {suppression_ratio:.5f}")
+    
+            # 4. Best-Response Estimator Fitting Precision
+            with torch.no_grad():
+                print("\nBest-Response Estimator Validation:")
+                for ag in range(self.num_agents):
+                    flat_phi = batch_acts[LEADER].reshape(-1, self.leader_act_dim)
+                    flat_state = batch_obs[BUYER][:, ag] / 100.0
+                    estimator_input = torch.cat([flat_phi, flat_state], dim=-1)
+                    target_returns = batch_rtgs[BUYER][:, ag]
+                    
+                    v_star = self.best_response_estimators[ag](estimator_input).squeeze()
+                    mse = torch.mean((v_star - target_returns) ** 2).item()
+                    print(f"  Estimator {ag} - V* Prediction Mean: {v_star.mean().item():.5f} | Target Mean: {target_returns.mean().item():.5f} | MSE Loss: {mse:.6f}")
+    
+            # 5. Environmental Physical Balance Check (At end of rollout)
+            last_idx = self.env.t - 1
+            recycled_volume = np.sum(self.env.waste_actual_d[..., last_idx])
+            landfilled_volume = np.sum(self.env.spot_q[..., last_idx])
+            freshwater_consumption = np.sum(self.env.inv[:, 0, last_idx])
+            
+            print("\nPhysical Environmental Flow Scales:")
+            print(f"  Wastewater Recycled Volume  : {recycled_volume:.2f}")
+            print(f"  Wastewater Landfilled Volume: {landfilled_volume:.2f}")
+            print(f"  Freshwater Consumed Volume  : {freshwater_consumption:.2f}")
+    
+            # 6. Active Global Market Parameters
+            if self.env.active_phi is not None:
+                print("\nActive Global Market Parameters (phi):")
+                print(f"  Price Multiplier (phi_0) : {self.env.active_phi[0]:.4f}")
+                print(f"  Recycle Subsidy (phi_1)  : {self.env.active_phi[1]:.4f}")
+                print(f"  Landfill Tax (phi_2)     : {self.env.active_phi[2]:.4f}")
+            print("="*70 + "\n")
             # =================================================================
             t_so_far += 1000  # Budgeted step count
             i_so_far += 1
