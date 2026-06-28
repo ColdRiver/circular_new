@@ -183,6 +183,56 @@ class BilevelTrainer:
 
         while t_so_far < total_timesteps:
             batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens = self.rollout()
+            # =================================================================
+            # CRITICAL BRL DIAGNOSTIC BLOCK
+            # =================================================================
+            print("\n" + "="*50)
+            print("            BRL GRADIENT & SCALE DIAGNOSTICS")
+            print("="*50)
+    
+            # Diagnostic 1: Check actual scale of Target Returns (RTGs) per stage/agent
+            for stage in stages:
+                rtgs = batch_rtgs[stage].cpu().numpy()
+                if stage != LEADER:
+                    print(f"Stage {stage} RTGs (Squeezed):")
+                    print(f"  Agent 0 (PAP)  - Mean: {rtgs[:, 0].mean():.5f}, Std: {rtgs[:, 0].std():.5f}")
+                    print(f"  Agent 1 (APAP) - Mean: {rtgs[:, 1].mean():.5f}, Std: {rtgs[:, 1].std():.5f}")
+                    print(f"  Agent 2 (Hyd)  - Mean: {rtgs[:, 2].mean():.5f}, Std: {rtgs[:, 2].std():.5f}")
+                else:
+                    print(f"Stage LEADER RTGs:")
+                    print(f"  Leader         - Mean: {rtgs.mean():.5f}, Std: {rtgs.std():.5f}")
+    
+            # Diagnostic 2: Check Advantage Scaling & Gradient Suppression
+            with torch.no_grad():
+                obs_tensor = batch_obs[BUYER]
+                # Predict values
+                V = torch.stack([
+                    self.buyer_agents[ag].critic(obs_tensor[:, ag, :] / 100.0).squeeze(-1) 
+                    for ag in range(self.num_agents)
+                ], dim=-1)
+                
+                A_k = batch_rtgs[BUYER] - V
+                global_std = A_k.std()
+                
+                print("\nAdvantage Suppression Analysis (BUYER stage):")
+                print(f"  Global Advantage Standard Deviation: {global_std.item():.5f}")
+                
+                for ag in range(self.num_agents):
+                    local_std = A_k[:, ag].std().item()
+                    effective_std = local_std / (global_std.item() + 1e-10)
+                    print(f"  Agent {ag} - Local Std: {local_std:.5f} | Effective Scale under Global Norm: {effective_std:.5f}")
+    
+            # Diagnostic 3: Check Best-Response Estimator Predictions
+            with torch.no_grad():
+                flat_phi = batch_acts[LEADER].reshape(-1, self.leader_act_dim)
+                flat_state = batch_obs[BUYER][:, 0] / 100.0
+                estimator_input = torch.cat([flat_phi, flat_state], dim=-1)
+                v_star = self.best_response_estimator(estimator_input).squeeze()
+                
+                print("\nBest-Response Estimator Metrics:")
+                print(f"  V* (Optimal Estimate) - Mean: {v_star.mean().item():.5f}, Std: {v_star.std().item():.5f}")
+            print("="*50 + "\n")
+            # =================================================================
             t_so_far += np.sum(batch_lens)
             i_so_far += 1
 
