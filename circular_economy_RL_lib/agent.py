@@ -121,8 +121,15 @@ class PPOAgent:
 
     def learn(self, batch_obs, batch_acts, batch_log_probs, batch_rtgs, n_itr):
         V, _, _ = self.evaluate(batch_obs, batch_acts)
+        
+        # Column-wise (agent-specific) Advantage Normalization preventing gradient suppression
         A_k = batch_rtgs - V.detach()
-        A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
+        if A_k.dim() > 1:
+            mean = A_k.mean(dim=0, keepdim=True)
+            std = A_k.std(dim=0, keepdim=True)
+            A_k = (A_k - mean) / (std + 1e-10)
+        else:
+            A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
 
         a_loss, c_loss = 0.0, 0.0
         for _ in range(n_itr):
@@ -133,7 +140,6 @@ class PPOAgent:
             b_acts = batch_acts[indices]
             b_log_probs = batch_log_probs[indices]
             
-            # Safe squeezing to prevent dimension broadcasting bugs
             b_rtgs = batch_rtgs[indices]
             if b_rtgs.dim() > 1 and b_rtgs.shape[-1] == 1:
                 b_rtgs = b_rtgs.squeeze(-1)
