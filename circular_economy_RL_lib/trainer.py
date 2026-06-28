@@ -252,99 +252,41 @@ class BilevelTrainer:
         while i_so_far < self.num_epochs:
             batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens = self.rollout()
             # =================================================================
-            # BRL DEEP GRADIENT & OPERATIONAL DIAGNOSTIC BLOCK
+            # ESTIMATOR FEATURE ALIGNMENT & RELATIVE ERROR DIAGNOSTICS
             # =================================================================
             print("\n" + "="*70)
-            print("          BRL SYSTEMIC CONVERGENCE AUDIT (EPOCH {})".format(i_so_far + 1))
+            print("          BRL ESTIMATOR FEATURE ALIGNMENT AUDIT (EPOCH {})".format(i_so_far + 1))
             print("="*70)
-    
-            # 1. Timescale Separation & Return Scaling
-            print("Rollout Unpenalized Returns (Averages):")
-            print(f"  Leader Stage    : {np.mean(batch_rets[LEADER]):.5f}")
-            print(f"  Buyer Stage     : {np.mean(batch_rets[BUYER], axis=0)}")
-            print(f"  Transform Stage : {np.mean(batch_rets[TRANSFORM], axis=0)}")
-    
-            # 2. Follower Exploration & Noise Decay Analysis
             with torch.no_grad():
-                leader_std = torch.exp(self.leader_agent.log_std).cpu().numpy()
-                buyer_stds = [torch.exp(self.buyer_agents[ag].log_std).cpu().numpy() for ag in range(self.num_agents)]
-                trans_stds = [torch.exp(self.trans_agents[ag].log_std).cpu().numpy() for ag in range(self.num_agents)]
+                # 1. Compare Raw Policy Outputs (phi_raw) vs Active Smoothed Rules (phi_active)
+                raw_phi = batch_acts[LEADER].cpu().numpy()
                 
-                print("\nExploration Noise (Policy Standard Deviations):")
-                print(f"  Leader std      : {leader_std}")
-                for ag in range(self.num_agents):
-                    print(f"  Buyer Agent {ag} std (Mean/Min/Max): {buyer_stds[ag].mean():.4f} / {buyer_stds[ag].min():.4f} / {buyer_stds[ag].max():.4f}")
-                    print(f"  Trans Agent {ag} std (Mean/Min/Max): {trans_stds[ag].mean():.4f} / {trans_stds[ag].min():.4f} / {trans_stds[ag].max():.4f}")
+                # Retrieve active phi directly from the simulator's active tracking
+                active_phi_history = np.array([self.env.active_phi for _ in range(len(raw_phi))]) if self.env.active_phi is not None else np.zeros_like(raw_phi)
+                
+                print("Leader Action Parameter Mismatch Analysis:")
+                print(f"  Raw Policy phi_0 (Mean/Std)   : {np.mean(raw_phi[:, 0]):.4f} / {np.std(raw_phi[:, 0]):.4f}")
+                print(f"  Active Smoothed phi_0 (Mean/Std): {np.mean(active_phi_history[:, 0]):.4f} / {np.std(active_phi_history[:, 0]):.4f}")
+                
+                # If the raw standard deviation is high while active is low, the estimator is receiving noisy features
+                print(f"  Action Variance Discrepancy Ratio (Raw / Active): {np.std(raw_phi[:, 0]) / (np.std(active_phi_history[:, 0]) + 1e-10):.2f}")
     
-                # Check action clipping limits (fraction of steps pinned to bounds)
-                flat_buyer_acts = batch_acts[BUYER].cpu().numpy().reshape(-1, self.buyer_act_dim)
-                flat_trans_acts = batch_acts[TRANSFORM].cpu().numpy().reshape(-1, self.trans_act_dim)
-                
-                buyer_lower_pinned = (flat_buyer_acts <= 0.015).mean() * 100.0
-                buyer_upper_pinned = (flat_buyer_acts >= 99.9).mean() * 100.0
-                trans_lower_pinned = (flat_trans_acts <= 0.015).mean() * 100.0
-                trans_upper_pinned = (flat_trans_acts >= 99.9).mean() * 100.0
-                
-                print("\nAction Boundary Saturation (Percentage Pinned to Bounds):")
-                print(f"  Buyer Actions     - Pinned to 0.01: {buyer_lower_pinned:.2f}% | Pinned to 100.0: {buyer_upper_pinned:.2f}%")
-                print(f"  Transform Actions - Pinned to 0.01: {trans_lower_pinned:.2f}% | Pinned to 100.0: {trans_upper_pinned:.2f}%")
-    
-            # 3. Advantage Scale Mismatch & Suppression Check
-            with torch.no_grad():
-                obs_tensor = batch_obs[BUYER]
-                
-                # Normalize states inside the audit
-                norm_obs = self.buyer_rms.normalize(obs_tensor.cpu().numpy())
-                obs_tensor_norm = torch.tensor(norm_obs, dtype=torch.float32).to(obs_tensor.device)
-                
-                V = torch.stack([
-                    self.buyer_agents[ag].critic(obs_tensor_norm[:, ag, :]).squeeze(-1) 
-                    for ag in range(self.num_agents)
-                ], dim=-1)
-                
-                A_k = batch_rtgs[BUYER] - V
-                global_std = A_k.std().item()
-                
-                print("\nAdvantage Scaling & Suppression (BUYER stage):")
-                print(f"  Global Advantage Standard Deviation: {global_std:.5f}")
-                for ag in range(self.num_agents):
-                    local_std = A_k[:, ag].std().item()
-                    suppression_ratio = local_std / (global_std + 1e-10)
-                    print(f"  Agent {ag} - Local Std: {local_std:.5f} | Suppression Ratio (Local / Global): {suppression_ratio:.5f}")
-    
-            # 4. Best-Response Estimator Fitting Precision
-            with torch.no_grad():
-                print("\nBest-Response Estimator Validation:")
+                # 2. Compute Relative Error of Value Estimators
+                print("\nEstimator Relative Error Analysis:")
                 for ag in range(self.num_agents):
                     flat_phi = batch_acts[LEADER].reshape(-1, self.leader_act_dim)
-                    raw_obs_buyer = batch_obs[BUYER].cpu().numpy()
-                    norm_obs_buyer = self.buyer_rms.normalize(raw_obs_buyer)
-                    flat_state_norm = torch.tensor(norm_obs_buyer[:, ag], dtype=torch.float32).to(batch_obs[BUYER].device)
-                    
+                    flat_state_norm = norm_obs_buyer[:, ag]
                     estimator_input = torch.cat([flat_phi, flat_state_norm], dim=-1)
                     target_returns = batch_rtgs[BUYER][:, ag]
                     
                     v_star = self.best_response_estimators[ag](estimator_input).squeeze()
-                    mse = torch.mean((v_star - target_returns) ** 2).item()
-                    print(f"  Estimator {ag} - V* Prediction Mean: {v_star.mean().item():.5f} | Target Mean: {target_returns.mean().item():.5f} | MSE Loss: {mse:.6f}")
-    
-            # 5. Environmental Physical Balance Check (At end of rollout)
-            last_idx = self.env.t - 1
-            recycled_volume = np.sum(self.env.waste_actual_d[..., last_idx])
-            landfilled_volume = np.sum(self.env.spot_q[..., last_idx])
-            freshwater_consumption = np.sum(self.env.spot_q[:, 0, last_idx])  # Corrected: Spot freshwater purchases
-            
-            print("\nPhysical Environmental Flow Scales:")
-            print(f"  Wastewater Recycled Volume  : {recycled_volume:.2f}")
-            print(f"  Wastewater Landfilled Volume: {landfilled_volume:.2f}")
-            print(f"  Freshwater Consumed Volume  : {freshwater_consumption:.2f}")
-    
-            # 6. Active Global Market Parameters
-            if self.env.active_phi is not None:
-                print("\nActive Global Market Parameters (phi):")
-                print(f"  Price Multiplier (phi_0) : {self.env.active_phi[0]:.4f}")
-                print(f"  Recycle Subsidy (phi_1)  : {self.env.active_phi[1]:.4f}")
-                print(f"  Landfill Tax (phi_2)     : {self.env.active_phi[2]:.4f}")
+                    
+                    # Relative Error = Mean(|V* - Target|) / Mean(|Target|)
+                    abs_errors = torch.abs(v_star - target_returns)
+                    mean_target_magnitude = torch.mean(torch.abs(target_returns)) + 1e-10
+                    relative_error = (torch.mean(abs_errors) / mean_target_magnitude).item() * 100.0
+                    
+                    print(f"  Estimator {ag} - V* Mean: {v_star.mean().item():.4f} | Target Mean: {target_returns.mean().item():.4f} | Relative Error: {relative_error:.2f}%")
             print("="*70 + "\n")
             # =================================================================
             t_so_far += 1000  # Budgeted step count
