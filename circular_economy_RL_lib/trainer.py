@@ -188,6 +188,44 @@ class BilevelTrainer:
         # Strict epoch-based outer loop constraint guaranteeing exactly num_epochs execution
         while i_so_far < self.num_epochs:
             batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens = self.rollout()
+            # =================================================================
+            # CRITICAL BRL STABILITY & CONVERGENCE DIAGNOSTICS
+            # =================================================================
+            print("\n" + "="*60)
+            print("          BRL CONVERGENCE & EXPLORATION DIAGNOSTICS")
+            print("="*60)
+    
+            # 1. Check Follower Exploration Standard Deviations (log_std)
+            with torch.no_grad():
+                buyer_stds = [torch.exp(self.buyer_agents[ag].log_std).cpu().numpy() for ag in range(self.num_agents)]
+                trans_stds = [torch.exp(self.trans_agents[ag].log_std).cpu().numpy() for ag in range(self.num_agents)]
+                leader_std = torch.exp(self.leader_agent.log_std).cpu().numpy()
+                
+                print("Exploration Noise (Standard Deviations):")
+                print(f"  Leader Std: {leader_std}")
+                for ag in range(self.num_agents):
+                    print(f"  Buyer Agent {ag} Std (Min/Max/Mean): {buyer_stds[ag].min():.4f} / {buyer_stds[ag].max():.4f} / {buyer_stds[ag].mean():.4f}")
+                    print(f"  Trans Agent {ag} Std (Min/Max/Mean): {trans_stds[ag].min():.4f} / {trans_stds[ag].max():.4f} / {trans_stds[ag].mean():.4f}")
+    
+            # 2. Check Physical Volume Balances in the Environment
+            last_idx = self.env.t - 1
+            recycled_volume = np.sum(self.env.waste_actual_d[..., last_idx])
+            landfilled_volume = np.sum(self.env.spot_q[..., last_idx])
+            freshwater_consumption = np.sum(self.env.inv[:, 0, last_idx])
+            
+            print("\nPhysical Environmental Metric Scales:")
+            print(f"  Wastewater Recycled Volume : {recycled_volume:.2f}")
+            print(f"  Wastewater Landfilled Volume: {landfilled_volume:.2f}")
+            print(f"  Freshwater Consumed Volume  : {freshwater_consumption:.2f}")
+    
+            # 3. Check Active Global Market Rules
+            if self.env.active_phi is not None:
+                print("\nActive Global Market Parameters (phi):")
+                print(f"  Price Multiplier (phi_0) : {self.env.active_phi[0]:.4f}")
+                print(f"  Recycle Subsidy (phi_1)  : {self.env.active_phi[1]:.4f}")
+                print(f"  Landfill Tax (phi_2)     : {self.env.active_phi[2]:.4f}")
+            print("="*60 + "\n")
+            # =================================================================
             t_so_far += 1000  # Budgeted step count
             i_so_far += 1
 
