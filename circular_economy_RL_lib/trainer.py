@@ -100,6 +100,7 @@ class BilevelTrainer:
         batch_acts = [[] for _ in stages]
         batch_log_probs = [[] for _ in stages]
         batch_rews = [[] for _ in stages]
+        batch_active_phi = []  # Tracks active smoothed parameters for estimator fitting
         batch_lens = []
 
         t = 0
@@ -123,12 +124,15 @@ class BilevelTrainer:
                 batch_log_probs[LEADER].append(log_p_leader)
                 
                 s_follower = self.env.step_sell(phi)
+                
+                # Track the active smoothed market parameters (phi_active)
+                batch_active_phi.append(self.env.active_phi)
+                
                 s_buyer = self.env.get_buyer_state(s_follower)
 
                 # --- Step 2: Followers decide trading quantities ---
                 batch_obs[BUYER].append(s_buyer)
                 
-                # Normalize buyer observations dynamically
                 self.buyer_rms.update(s_buyer)
                 s_buyer_norm = self.buyer_rms.normalize(s_buyer)
                 
@@ -149,7 +153,6 @@ class BilevelTrainer:
                 # --- Step 3: Followers decide transformation/utility ---
                 batch_obs[TRANSFORM].append(s_trans)
                 
-                # Normalize transformer observations dynamically
                 self.trans_rms.update(s_trans)
                 s_trans_norm = self.trans_rms.normalize(s_trans)
                 
@@ -186,7 +189,7 @@ class BilevelTrainer:
         tensor_log_probs = [torch.tensor(np.array(lp), dtype=torch.float) for lp in batch_log_probs]
 
         batch_rtgs, batch_rets = self.compute_rtgs(batch_obs, batch_rews, batch_lens)
-        return tensor_obs, tensor_acts, tensor_log_probs, batch_rtgs, batch_rets, batch_lens
+        return tensor_obs, tensor_acts, tensor_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi
 
     def compute_rtgs(self, batch_obs, batch_rews, batch_lens):
         batch_rtgs = [[] for _ in stages]
@@ -250,38 +253,40 @@ class BilevelTrainer:
         i_so_far = 0
 
         while i_so_far < self.num_epochs:
-            batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens = self.rollout()
+            batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi = self.rollout()
+            t_so_far += 1000  # Budgeted step count
+            i_so_far += 1
+
             # =================================================================
-            # ESTIMATOR FEATURE ALIGNMENT & RELATIVE ERROR DIAGNOSTICS
+            # INTEGRATED BRL FEATURE ALIGNMENT & RELATIVE ERROR DIAGNOSTICS
             # =================================================================
             print("\n" + "="*70)
-            print("          BRL ESTIMATOR FEATURE ALIGNMENT AUDIT (EPOCH {})".format(i_so_far + 1))
+            print("          BRL ESTIMATOR FEATURE ALIGNMENT AUDIT (EPOCH {})".format(i_so_far))
             print("="*70)
             with torch.no_grad():
-                # 1. Compare Raw Policy Outputs (phi_raw) vs Active Smoothed Rules (phi_active)
                 raw_phi = batch_acts[LEADER].cpu().numpy()
-                
-                # Retrieve active phi directly from the simulator's active tracking
                 active_phi_history = np.array([self.env.active_phi for _ in range(len(raw_phi))]) if self.env.active_phi is not None else np.zeros_like(raw_phi)
                 
                 print("Leader Action Parameter Mismatch Analysis:")
                 print(f"  Raw Policy phi_0 (Mean/Std)   : {np.mean(raw_phi[:, 0]):.4f} / {np.std(raw_phi[:, 0]):.4f}")
                 print(f"  Active Smoothed phi_0 (Mean/Std): {np.mean(active_phi_history[:, 0]):.4f} / {np.std(active_phi_history[:, 0]):.4f}")
-                
-                # If the raw standard deviation is high while active is low, the estimator is receiving noisy features
                 print(f"  Action Variance Discrepancy Ratio (Raw / Active): {np.std(raw_phi[:, 0]) / (np.std(active_phi_history[:, 0]) + 1e-10):.2f}")
-    
-                # 2. Compute Relative Error of Value Estimators
-                print("\nEstimator Relative Error Analysis:")
+
+                # Safe on-the-fly normalization for diagnostic relative error check
+                raw_obs_buyer_diag = batch_obs[BUYER].cpu().numpy()
+                norm_obs_buyer_diag = self.buyer_rms.normalize(raw_obs_buyer_diag)
+                norm_obs_buyer_tensor = torch.tensor(norm_obs_buyer_diag, dtype=torch.float32).to(batch_obs[BUYER].device)
+
+                flat_active_phi_diag = torch.tensor(np.array(batch_active_phi), dtype=torch.float32).reshape(-1, self.leader_act_dim).to(batch_obs[BUYER].device)
+
+                print("\nEstimator Relative Error Analysis (Active phi):")
                 for ag in range(self.num_agents):
-                    flat_phi = batch_acts[LEADER].reshape(-1, self.leader_act_dim)
-                    flat_state_norm = norm_obs_buyer[:, ag]
-                    estimator_input = torch.cat([flat_phi, flat_state_norm], dim=-1)
+                    flat_state_norm = norm_obs_buyer_tensor[:, ag]
+                    estimator_input = torch.cat([flat_active_phi_diag, flat_state_norm], dim=-1)
                     target_returns = batch_rtgs[BUYER][:, ag]
                     
                     v_star = self.best_response_estimators[ag](estimator_input).squeeze()
                     
-                    # Relative Error = Mean(|V* - Target|) / Mean(|Target|)
                     abs_errors = torch.abs(v_star - target_returns)
                     mean_target_magnitude = torch.mean(torch.abs(target_returns)) + 1e-10
                     relative_error = (torch.mean(abs_errors) / mean_target_magnitude).item() * 100.0
@@ -289,11 +294,8 @@ class BilevelTrainer:
                     print(f"  Estimator {ag} - V* Mean: {v_star.mean().item():.4f} | Target Mean: {target_returns.mean().item():.4f} | Relative Error: {relative_error:.2f}%")
             print("="*70 + "\n")
             # =================================================================
-            t_so_far += 1000  # Budgeted step count
-            i_so_far += 1
 
             # --- Update Lower-Level Follower Policies ---
-            # Update running statistics and retrieve normalized state batches
             raw_obs_buyer = batch_obs[BUYER].cpu().numpy()
             self.buyer_rms.update(raw_obs_buyer)
             norm_obs_buyer = torch.tensor(self.buyer_rms.normalize(raw_obs_buyer), dtype=torch.float32).to(batch_obs[BUYER].device)
@@ -320,10 +322,10 @@ class BilevelTrainer:
                 self.writer.add_scalar(f'trans_critic_loss_agent_{ag}', c_loss_t, t_so_far)
 
             # --- Update Best-Response Value Estimators ---
+            flat_active_phi = torch.tensor(np.array(batch_active_phi), dtype=torch.float32).reshape(-1, self.leader_act_dim).to(batch_obs[BUYER].device)
             for ag in range(self.num_agents):
-                flat_phi = batch_acts[LEADER].reshape(-1, self.leader_act_dim)
-                flat_state_norm = norm_obs_buyer[:, ag]  # Feed normalized state
-                estimator_input = torch.cat([flat_phi, flat_state_norm], dim=-1)
+                flat_state_norm = norm_obs_buyer[:, ag]
+                estimator_input = torch.cat([flat_active_phi, flat_state_norm], dim=-1)
                 target_returns = batch_rtgs[BUYER][:, ag]
                 
                 loss_est = self.best_response_estimators[ag].update(estimator_input, target_returns)
@@ -332,10 +334,10 @@ class BilevelTrainer:
             # --- Update Upper-Level Leader Policy ---
             if i_so_far % self.leader_update_frequency == 0:
                 penalties = []
+                flat_active_phi = torch.tensor(np.array(batch_active_phi), dtype=torch.float32).reshape(-1, self.leader_act_dim).to(batch_obs[BUYER].device)
                 for ag in range(self.num_agents):
-                    flat_phi = batch_acts[LEADER].reshape(-1, self.leader_act_dim)
                     flat_state_norm = norm_obs_buyer[:, ag]
-                    estimator_input = torch.cat([flat_phi, flat_state_norm], dim=-1)
+                    estimator_input = torch.cat([flat_active_phi, flat_state_norm], dim=-1)
                     
                     v_star = self.best_response_estimators[ag](estimator_input).squeeze().detach()
                     v_actual = batch_rtgs[BUYER][:, ag]
@@ -343,10 +345,11 @@ class BilevelTrainer:
                 
                 total_penalty = torch.stack(penalties, dim=0).mean(dim=0).unsqueeze(-1).detach()
                 
+                # Soft penalty clipping
                 clamped_penalty = torch.clamp(total_penalty, min=-10.0, max=10.0)
                 penalized_rtgs = batch_rtgs[LEADER] - self.lambda_penalty * clamped_penalty
 
-                # Update Leader Agent with normalized states
+                # Update Leader Agent with normalized states (retaining raw batch_acts for standard PPO math)
                 raw_obs_leader = batch_obs[LEADER].cpu().numpy()
                 self.leader_rms.update(raw_obs_leader)
                 norm_obs_leader = torch.tensor(self.leader_rms.normalize(raw_obs_leader), dtype=torch.float32).to(batch_obs[LEADER].device)
