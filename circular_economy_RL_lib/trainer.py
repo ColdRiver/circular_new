@@ -291,6 +291,34 @@ class BilevelTrainer:
                 print(f"  Landfill Tax (phi_2)     : {self.env.active_phi[2]:.4f}")
             print("="*70 + "\n")
             # =================================================================
+            # =================================================================
+            # CRITIC NETWORK INITIALIZATION & GRADIENT AUDIT
+            # =================================================================
+            print("\n" + "="*60)
+            print("          CRITIC WEIGHTS & OUTPUT SCALES AUDIT")
+            print("="*60)
+            with torch.no_grad():
+                for ag in range(self.num_agents):
+                    # Evaluate the raw critic weights and output scales for Buyer Critics
+                    buyer_critic = self.buyer_agents[ag].critic
+                    weight_norm_l1 = buyer_critic.layer1.weight.norm().item()
+                    weight_norm_l3 = buyer_critic.layer3.weight.norm().item()
+                    
+                    # Check initial predictions on zero inputs
+                    zero_input = torch.zeros(1, self.buyer_obs_dim)
+                    initial_prediction = buyer_critic(zero_input).item()
+                    
+                    print(f"Buyer Critic {ag} Diagnostics:")
+                    print(f"  Layer 1 Weight Norm: {weight_norm_l1:.4f} | Output Layer (Layer 3) Weight Norm: {weight_norm_l3:.4f}")
+                    print(f"  Initial Value Prediction on Zero Input: {initial_prediction:.4f}")
+                    
+                    if abs(initial_prediction) > 1.0 or weight_norm_l3 > 1.0:
+                        print(f"  [CRITICAL SCALE DISCREPANCY]: Critic {ag} is initialized with excessive gain!")
+                        print("  This causes exploded value targets and corrupts GAE estimations.")
+                    else:
+                        print(f"  [STATUS]: Critic {ag} scale aligned successfully.")
+            print("="*60 + "\n")
+            # =================================================================
             t_so_far += 1000  # Budgeted step count
             i_so_far += 1
 
