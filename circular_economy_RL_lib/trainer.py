@@ -6,6 +6,43 @@ from agent import PPOAgent, OptimalFollowerValueEstimator
 from config import config, LEADER, BUYER, TRANSFORM, stages
 from torch.utils.tensorboard import SummaryWriter
 
+class RunningMeanStd:
+    """
+    Tracks running mean and variance of observations using Welford's algorithm
+    to normalize state features dynamically into a stable [-1.0, 1.0] range.
+    """
+    def __init__(self, shape):
+        self.mean = np.zeros(shape, dtype=np.float32)
+        self.var = np.ones(shape, dtype=np.float32)
+        self.count = 1e-4
+
+    def update(self, x):
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0] if x.ndim > 1 else 1
+        
+        if x.ndim == 1:
+            x = np.expand_dims(x, axis=0)
+            batch_mean = x[0]
+            batch_var = np.zeros_like(batch_mean)
+            batch_count = 1
+            
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+        
+    def normalize(self, x):
+        return (x - self.mean) / np.sqrt(self.var + 1e-8)
+
 class BilevelTrainer:
     def __init__(self):
         for key, value in config.items():
@@ -39,6 +76,11 @@ class BilevelTrainer:
             for _ in range(self.num_agents)
         ]
         
+        # Initialize running mean-std normalizers for each stage
+        self.leader_rms = RunningMeanStd(shape=(self.leader_obs_dim,))
+        self.buyer_rms = RunningMeanStd(shape=(self.num_agents, self.buyer_obs_dim))
+        self.trans_rms = RunningMeanStd(shape=(self.num_agents, self.trans_obs_dim))
+        
         # Follower agents maintain standard [0.01, 100.0] action bounds
         self.buyer_agents = [
             PPOAgent(
@@ -70,24 +112,30 @@ class BilevelTrainer:
                 t += 1
                 
                 # --- Step 1: Upper-Level Leader decides rules (phi) ---
-                # Step-by-step updates for mathematically valid importance ratios
                 batch_obs[LEADER].append(s_leader)
-                phi, log_p_leader = self.leader_agent.get_action(s_leader / 100.0)
+                
+                # Normalize leader observation dynamically
+                self.leader_rms.update(s_leader)
+                s_leader_norm = self.leader_rms.normalize(s_leader)
+                
+                phi, log_p_leader = self.leader_agent.get_action(s_leader_norm)
                 batch_acts[LEADER].append(phi)
                 batch_log_probs[LEADER].append(log_p_leader)
                 
-                # Update follower environment with regulatory state
                 s_follower = self.env.step_sell(phi)
-
-                # Reconstruct step 2 buyer states (1908 dimensions)
                 s_buyer = self.env.get_buyer_state(s_follower)
 
                 # --- Step 2: Followers decide trading quantities ---
                 batch_obs[BUYER].append(s_buyer)
+                
+                # Normalize buyer observations dynamically
+                self.buyer_rms.update(s_buyer)
+                s_buyer_norm = self.buyer_rms.normalize(s_buyer)
+                
                 buyer_actions = []
                 log_p_buyers = []
                 for ag in range(self.num_agents):
-                    act_b, log_p_b = self.buyer_agents[ag].get_action(s_buyer[ag] / 100.0)
+                    act_b, log_p_b = self.buyer_agents[ag].get_action(s_buyer_norm[ag])
                     buyer_actions.append(act_b)
                     log_p_buyers.append(log_p_b)
                 
@@ -95,18 +143,20 @@ class BilevelTrainer:
                 batch_acts[BUYER].append(buyer_actions)
                 batch_log_probs[BUYER].append(log_p_buyers)
 
-                # Step the buying environment
                 rew_b = self.env.step_buy(buyer_actions)
-
-                # Reconstruct step 3 transformer states (2088 dimensions)
                 s_trans = self.env.get_trans_state(s_buyer)
 
                 # --- Step 3: Followers decide transformation/utility ---
                 batch_obs[TRANSFORM].append(s_trans)
+                
+                # Normalize transformer observations dynamically
+                self.trans_rms.update(s_trans)
+                s_trans_norm = self.trans_rms.normalize(s_trans)
+                
                 trans_actions = []
                 log_p_trans = []
                 for ag in range(self.num_agents):
-                    act_t, log_p_t = self.trans_agents[ag].get_action(s_trans[ag] / 100.0)
+                    act_t, log_p_t = self.trans_agents[ag].get_action(s_trans_norm[ag])
                     trans_actions.append(act_t)
                     log_p_trans.append(log_p_t)
                 
@@ -114,7 +164,6 @@ class BilevelTrainer:
                 batch_acts[TRANSFORM].append(trans_actions)
                 batch_log_probs[TRANSFORM].append(log_p_trans)
 
-                # Step the transformation environment
                 s_leader_next, s_follower_next, rew_t, rew_l, done = self.env.step_trans(trans_actions)
 
                 ep_rews[LEADER].append(rew_l)
@@ -123,6 +172,7 @@ class BilevelTrainer:
 
                 s_leader = s_leader_next
                 s_follower = s_follower_next
+                s_buyer = self.env.get_buyer_state(s_follower)
 
                 if done:
                     break
@@ -135,50 +185,50 @@ class BilevelTrainer:
         tensor_acts = [torch.tensor(np.array(act), dtype=torch.float) for act in batch_acts]
         tensor_log_probs = [torch.tensor(np.array(lp), dtype=torch.float) for lp in batch_log_probs]
 
-        # Evaluate GAE-Lambda returns
         batch_rtgs, batch_rets = self.compute_rtgs(batch_obs, batch_rews, batch_lens)
         return tensor_obs, tensor_acts, tensor_log_probs, batch_rtgs, batch_rets, batch_lens
 
     def compute_rtgs(self, batch_obs, batch_rews, batch_lens):
-        """
-        Calculates GAE-Lambda advantages and value targets
-        """
         batch_rtgs = [[] for _ in stages]
         batch_rets = [[] for _ in stages]
         for stage in stages:
             ep_ret_list = []
             flat_rtg_list = []
             
-            obs_tensor = torch.tensor(np.array(batch_obs[stage]), dtype=torch.float32)
+            # Retrieve raw observations and normalize using running statistics
+            raw_obs = np.array(batch_obs[stage])
+            if stage == LEADER:
+                norm_obs = self.leader_rms.normalize(raw_obs)
+            elif stage == BUYER:
+                norm_obs = self.buyer_rms.normalize(raw_obs)
+            else:
+                norm_obs = self.trans_rms.normalize(raw_obs)
+                
+            obs_tensor = torch.tensor(norm_obs, dtype=torch.float32)
             num_episodes = len(batch_rews[stage])
             
             with torch.no_grad():
                 if stage == LEADER:
-                    # leader critic returns (num_total_steps, 1) -> squeeze to (num_total_steps,)
-                    V = self.leader_agent.critic(obs_tensor / 100.0).squeeze(-1)
+                    V = self.leader_agent.critic(obs_tensor).squeeze(-1)
                 elif stage == BUYER:
-                    # obs_tensor has shape (num_total_steps, 3, 1908). Corrected: Slice along Dim 1 (ag)
-                    V = torch.stack([self.buyer_agents[ag].critic(obs_tensor[:, ag, :] / 100.0).squeeze(-1) for ag in range(self.num_agents)], dim=-1)
+                    V = torch.stack([self.buyer_agents[ag].critic(obs_tensor[:, ag, :]).squeeze(-1) for ag in range(self.num_agents)], dim=-1)
                 else:
-                    # obs_tensor has shape (num_total_steps, 3, 2088). Corrected: Slice along Dim 1 (ag)
-                    V = torch.stack([self.trans_agents[ag].critic(obs_tensor[:, ag, :] / 100.0).squeeze(-1) for ag in range(self.num_agents)], dim=-1)
+                    V = torch.stack([self.trans_agents[ag].critic(obs_tensor[:, ag, :]).squeeze(-1) for ag in range(self.num_agents)], dim=-1)
             
             V = V.cpu().numpy()
             
-            # Split the flat value predictions along the step dimension into individual episodes
             V_episodes = []
             curr_idx = 0
             for ep_len_val in batch_lens:
                 V_episodes.append(V[curr_idx:curr_idx + ep_len_val])
                 curr_idx += ep_len_val
             
-            # Calculate GAE advantages for each episode
             for ep in range(num_episodes):
                 rews = np.array(batch_rews[stage][ep])
                 vals = V_episodes[ep]
                 
                 advantages = np.zeros_like(rews)
-                gae = np.zeros_like(rews[0])  # Adapts automatically to scalar or vector shapes
+                gae = np.zeros_like(rews[0])
                 
                 for t in reversed(range(len(rews))):
                     next_val = vals[t+1] if t + 1 < len(rews) else np.zeros_like(rews[0])
@@ -190,7 +240,6 @@ class BilevelTrainer:
                 flat_rtg_list.extend(rtg)
                 ep_ret_list.append(rtg[0])
                 
-            # Convert flat list of step returns directly to PyTorch tensor
             batch_rtgs[stage] = torch.tensor(np.array(flat_rtg_list), dtype=torch.float)
             batch_rets[stage] = np.mean(ep_ret_list, axis=0)
             
@@ -200,53 +249,33 @@ class BilevelTrainer:
         t_so_far = 0
         i_so_far = 0
 
-        # Strict epoch-based outer loop constraint guaranteeing exactly num_epochs execution
         while i_so_far < self.num_epochs:
             batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens = self.rollout()
-            # =================================================================
-            # STATE FEATURE RANGE AUDITOR
-            # =================================================================
-            print("\n" + "="*60)
-            print("          BRL STATE FEATURE SCALE & RANGE AUDIT")
-            print("="*60)
-            with torch.no_grad():
-                for ag in range(self.num_agents):
-                    # Retrieve the unscaled state tensors collected in the batch
-                    flat_state = batch_obs[BUYER][:, ag].cpu().numpy()
-                    
-                    # Check for extreme outlier features in the state vector
-                    max_feature_val = np.max(flat_state)
-                    min_feature_val = np.min(flat_state)
-                    mean_feature_val = np.mean(flat_state)
-                    
-                    print(f"Agent {ag} (PAP/APAP/Hyd) State Feature Ranges:")
-                    print(f"  Unscaled State - Min: {min_feature_val:.2f} | Max: {max_feature_val:.2f} | Mean: {mean_feature_val:.2f}")
-                    
-                    # Highlight if state division by 100.0 is insufficient
-                    scaled_max = max_feature_val / 100.0
-                    if scaled_max > 10.0:
-                        print(f"  [CRITICAL FEATURE SCALE DISCREPANCY]: Agent {ag} has features that exceed 10.0 even after division (Max: {scaled_max:.2f})!")
-                        print("  This causes parameter explosion in linear layers and corrupts best-response estimates.")
-                    else:
-                        print(f"  [STATUS]: Agent {ag} state features are scaled stably.")
-            print("="*60 + "\n")
-            # =================================================================
             t_so_far += 1000  # Budgeted step count
             i_so_far += 1
 
             # --- Update Lower-Level Follower Policies ---
+            # Update running statistics and retrieve normalized state batches
+            raw_obs_buyer = batch_obs[BUYER].cpu().numpy()
+            self.buyer_rms.update(raw_obs_buyer)
+            norm_obs_buyer = torch.tensor(self.buyer_rms.normalize(raw_obs_buyer), dtype=torch.float32).to(batch_obs[BUYER].device)
+
+            raw_obs_trans = batch_obs[TRANSFORM].cpu().numpy()
+            self.trans_rms.update(raw_obs_trans)
+            norm_obs_trans = torch.tensor(self.trans_rms.normalize(raw_obs_trans), dtype=torch.float32).to(batch_obs[TRANSFORM].device)
+
             for ag in range(self.num_agents):
-                # Update Buyer Agents
+                # Update Buyer Agents with normalized states
                 a_loss_b, c_loss_b = self.buyer_agents[ag].learn(
-                    batch_obs[BUYER][:, ag] / 100.0, batch_acts[BUYER][:, ag], 
+                    norm_obs_buyer[:, ag], batch_acts[BUYER][:, ag], 
                     batch_log_probs[BUYER][:, ag], batch_rtgs[BUYER][:, ag], 10
                 )
                 self.writer.add_scalar(f'buyer_actor_loss_agent_{ag}', a_loss_b, t_so_far)
                 self.writer.add_scalar(f'buyer_critic_loss_agent_{ag}', c_loss_b, t_so_far)
 
-                # Update Transformer Agents
+                # Update Transformer Agents with normalized states
                 a_loss_t, c_loss_t = self.trans_agents[ag].learn(
-                    batch_obs[TRANSFORM][:, ag] / 100.0, batch_acts[TRANSFORM][:, ag], 
+                    norm_obs_trans[:, ag], batch_acts[TRANSFORM][:, ag], 
                     batch_log_probs[TRANSFORM][:, ag], batch_rtgs[TRANSFORM][:, ag], 10
                 )
                 self.writer.add_scalar(f'trans_actor_loss_agent_{ag}', a_loss_t, t_so_far)
@@ -255,8 +284,8 @@ class BilevelTrainer:
             # --- Update Best-Response Value Estimators ---
             for ag in range(self.num_agents):
                 flat_phi = batch_acts[LEADER].reshape(-1, self.leader_act_dim)
-                flat_state = batch_obs[BUYER][:, ag] / 100.0
-                estimator_input = torch.cat([flat_phi, flat_state], dim=-1)
+                flat_state_norm = norm_obs_buyer[:, ag]  # Feed normalized state
+                estimator_input = torch.cat([flat_phi, flat_state_norm], dim=-1)
                 target_returns = batch_rtgs[BUYER][:, ag]
                 
                 loss_est = self.best_response_estimators[ag].update(estimator_input, target_returns)
@@ -267,8 +296,8 @@ class BilevelTrainer:
                 penalties = []
                 for ag in range(self.num_agents):
                     flat_phi = batch_acts[LEADER].reshape(-1, self.leader_act_dim)
-                    flat_state = batch_obs[BUYER][:, ag] / 100.0
-                    estimator_input = torch.cat([flat_phi, flat_state], dim=-1)
+                    flat_state_norm = norm_obs_buyer[:, ag]
+                    estimator_input = torch.cat([flat_phi, flat_state_norm], dim=-1)
                     
                     v_star = self.best_response_estimators[ag](estimator_input).squeeze().detach()
                     v_actual = batch_rtgs[BUYER][:, ag]
@@ -276,12 +305,16 @@ class BilevelTrainer:
                 
                 total_penalty = torch.stack(penalties, dim=0).mean(dim=0).unsqueeze(-1).detach()
                 
-                # Soft penalty clipping
                 clamped_penalty = torch.clamp(total_penalty, min=-10.0, max=10.0)
                 penalized_rtgs = batch_rtgs[LEADER] - self.lambda_penalty * clamped_penalty
 
+                # Update Leader Agent with normalized states
+                raw_obs_leader = batch_obs[LEADER].cpu().numpy()
+                self.leader_rms.update(raw_obs_leader)
+                norm_obs_leader = torch.tensor(self.leader_rms.normalize(raw_obs_leader), dtype=torch.float32).to(batch_obs[LEADER].device)
+
                 a_loss_l, c_loss_l = self.leader_agent.learn(
-                    batch_obs[LEADER] / 100.0, batch_acts[LEADER], 
+                    norm_obs_leader, batch_acts[LEADER], 
                     batch_log_probs[LEADER], penalized_rtgs, 10
                 )
                 self.writer.add_scalar('leader_actor_loss', a_loss_l, t_so_far)
