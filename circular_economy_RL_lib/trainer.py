@@ -64,7 +64,6 @@ class BilevelTrainer:
         self.leader_act_dim = 3  
         self.leader_obs_dim = self.num_commodities + 2 # 14
 
-        # Initialize Leader Agent with continuous bounds [0.1, 10.0] matching the active physical envelope
         self.leader_agent = PPOAgent(
             self.leader_obs_dim, self.leader_act_dim, f"{self.result_folder}/chpkt/leader", 
             lr=self.lr_leader, min_val=0.1, max_val=10.0
@@ -76,12 +75,6 @@ class BilevelTrainer:
             for _ in range(self.num_agents)
         ]
         
-        # Initialize running mean-std normalizers for each stage
-        self.leader_rms = RunningMeanStd(shape=(self.leader_obs_dim,))
-        self.buyer_rms = RunningMeanStd(shape=(self.num_agents, self.buyer_obs_dim))
-        self.trans_rms = RunningMeanStd(shape=(self.num_agents, self.trans_obs_dim))
-        
-        # Follower agents maintain standard [0.01, 100.0] action bounds
         self.buyer_agents = [
             PPOAgent(
                 self.buyer_obs_dim, self.buyer_act_dim, f"{self.result_folder}/chpkt/buyer_{ag}", 
@@ -94,6 +87,11 @@ class BilevelTrainer:
                 lr=self.lr_follower, min_val=0.01, max_val=100.0
             ) for ag in range(self.num_agents)
         ]
+
+        # Initialize running mean-std normalizers for each stage
+        self.leader_rms = RunningMeanStd(shape=(self.leader_obs_dim,))
+        self.buyer_rms = RunningMeanStd(shape=(self.num_agents, self.buyer_obs_dim))
+        self.trans_rms = RunningMeanStd(shape=(self.num_agents, self.trans_obs_dim))
 
     def rollout(self):
         batch_obs = [[] for _ in stages]
@@ -113,6 +111,7 @@ class BilevelTrainer:
                 t += 1
                 
                 # --- Step 1: Upper-Level Leader decides rules (phi) ---
+                # Step-by-step updates for mathematically valid importance ratios
                 batch_obs[LEADER].append(s_leader)
                 
                 # Normalize leader observation dynamically
@@ -192,6 +191,9 @@ class BilevelTrainer:
         return tensor_obs, tensor_acts, tensor_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi
 
     def compute_rtgs(self, batch_obs, batch_rews, batch_lens):
+        """
+        Calculates GAE-Lambda advantages and value targets
+        """
         batch_rtgs = [[] for _ in stages]
         batch_rets = [[] for _ in stages]
         for stage in stages:
@@ -257,45 +259,10 @@ class BilevelTrainer:
             t_so_far += 1000  # Budgeted step count
             i_so_far += 1
 
-            # =================================================================
-            # INTEGRATED BRL FEATURE ALIGNMENT & RELATIVE ERROR DIAGNOSTICS
-            # =================================================================
-            print("\n" + "="*70)
-            print("          BRL ESTIMATOR FEATURE ALIGNMENT AUDIT (EPOCH {})".format(i_so_far))
-            print("="*70)
-            with torch.no_grad():
-                raw_phi = batch_acts[LEADER].cpu().numpy()
-                active_phi_history = np.array([self.env.active_phi for _ in range(len(raw_phi))]) if self.env.active_phi is not None else np.zeros_like(raw_phi)
-                
-                print("Leader Action Parameter Mismatch Analysis:")
-                print(f"  Raw Policy phi_0 (Mean/Std)   : {np.mean(raw_phi[:, 0]):.4f} / {np.std(raw_phi[:, 0]):.4f}")
-                print(f"  Active Smoothed phi_0 (Mean/Std): {np.mean(active_phi_history[:, 0]):.4f} / {np.std(active_phi_history[:, 0]):.4f}")
-                print(f"  Action Variance Discrepancy Ratio (Raw / Active): {np.std(raw_phi[:, 0]) / (np.std(active_phi_history[:, 0]) + 1e-10):.2f}")
-
-                # Safe on-the-fly normalization for diagnostic relative error check
-                raw_obs_buyer_diag = batch_obs[BUYER].cpu().numpy()
-                norm_obs_buyer_diag = self.buyer_rms.normalize(raw_obs_buyer_diag)
-                norm_obs_buyer_tensor = torch.tensor(norm_obs_buyer_diag, dtype=torch.float32).to(batch_obs[BUYER].device)
-
-                flat_active_phi_diag = torch.tensor(np.array(batch_active_phi), dtype=torch.float32).reshape(-1, self.leader_act_dim).to(batch_obs[BUYER].device)
-
-                print("\nEstimator Relative Error Analysis (Active phi):")
-                for ag in range(self.num_agents):
-                    flat_state_norm = norm_obs_buyer_tensor[:, ag]
-                    estimator_input = torch.cat([flat_active_phi_diag, flat_state_norm], dim=-1)
-                    target_returns = batch_rtgs[BUYER][:, ag]
-                    
-                    v_star = self.best_response_estimators[ag](estimator_input).squeeze()
-                    
-                    abs_errors = torch.abs(v_star - target_returns)
-                    mean_target_magnitude = torch.mean(torch.abs(target_returns)) + 1e-10
-                    relative_error = (torch.mean(abs_errors) / mean_target_magnitude).item() * 100.0
-                    
-                    print(f"  Estimator {ag} - V* Mean: {v_star.mean().item():.4f} | Target Mean: {target_returns.mean().item():.4f} | Relative Error: {relative_error:.2f}%")
-            print("="*70 + "\n")
-            # =================================================================
-
             # --- Update Lower-Level Follower Policies ---
+            # Exponentially decay entropy coefficient from 0.05 to 0.005 over 100 epochs
+            ent_coef = max(0.005, 0.05 * (0.95 ** i_so_far))
+
             raw_obs_buyer = batch_obs[BUYER].cpu().numpy()
             self.buyer_rms.update(raw_obs_buyer)
             norm_obs_buyer = torch.tensor(self.buyer_rms.normalize(raw_obs_buyer), dtype=torch.float32).to(batch_obs[BUYER].device)
@@ -305,23 +272,24 @@ class BilevelTrainer:
             norm_obs_trans = torch.tensor(self.trans_rms.normalize(raw_obs_trans), dtype=torch.float32).to(batch_obs[TRANSFORM].device)
 
             for ag in range(self.num_agents):
-                # Update Buyer Agents with normalized states
+                # Update Buyer Agents with normalized states and decaying entropy
                 a_loss_b, c_loss_b = self.buyer_agents[ag].learn(
                     norm_obs_buyer[:, ag], batch_acts[BUYER][:, ag], 
-                    batch_log_probs[BUYER][:, ag], batch_rtgs[BUYER][:, ag], 10
+                    batch_log_probs[BUYER][:, ag], batch_rtgs[BUYER][:, ag], 10, entropy_coef=ent_coef
                 )
                 self.writer.add_scalar(f'buyer_actor_loss_agent_{ag}', a_loss_b, t_so_far)
                 self.writer.add_scalar(f'buyer_critic_loss_agent_{ag}', c_loss_b, t_so_far)
 
-                # Update Transformer Agents with normalized states
+                # Update Transformer Agents with normalized states and decaying entropy
                 a_loss_t, c_loss_t = self.trans_agents[ag].learn(
                     norm_obs_trans[:, ag], batch_acts[TRANSFORM][:, ag], 
-                    batch_log_probs[TRANSFORM][:, ag], batch_rtgs[TRANSFORM][:, ag], 10
+                    batch_log_probs[TRANSFORM][:, ag], batch_rtgs[TRANSFORM][:, ag], 10, entropy_coef=ent_coef
                 )
                 self.writer.add_scalar(f'trans_actor_loss_agent_{ag}', a_loss_t, t_so_far)
                 self.writer.add_scalar(f'trans_critic_loss_agent_{ag}', c_loss_t, t_so_far)
 
             # --- Update Best-Response Value Estimators ---
+            # Train estimators on active, smoothed market parameters to prevent functional collapse
             flat_active_phi = torch.tensor(np.array(batch_active_phi), dtype=torch.float32).reshape(-1, self.leader_act_dim).to(batch_obs[BUYER].device)
             for ag in range(self.num_agents):
                 flat_state_norm = norm_obs_buyer[:, ag]
@@ -356,7 +324,7 @@ class BilevelTrainer:
 
                 a_loss_l, c_loss_l = self.leader_agent.learn(
                     norm_obs_leader, batch_acts[LEADER], 
-                    batch_log_probs[LEADER], penalized_rtgs, 10
+                    batch_log_probs[LEADER], penalized_rtgs, 10, entropy_coef=ent_coef
                 )
                 self.writer.add_scalar('leader_actor_loss', a_loss_l, t_so_far)
                 self.writer.add_scalar('leader_critic_loss', c_loss_l, t_so_far)
