@@ -258,20 +258,27 @@ class Manufacturing_Simulator:
         agent0 = tx_u[0]
         agent1 = tx_u[1]
         agent2 = tx_u[2]
-
+    
         agents_final_output_vec = np.zeros_like(tx_u)
         agent0_surrogate_input_vec = np.array([agent0[5], agent0[7], agent0[2], agent0[0], agent0[1]])
         agent0_surrogate_output_vec = self.surrogate_model.get_apap_model_outputs(agent0_surrogate_input_vec.reshape(1,-1))
         agents_final_output_vec[0, [2, 6, 0]] = np.array(agent0_surrogate_output_vec)[0, [0, 1, 3]]
         self.wastewater[:, :, self.t] = np.array(agent0_surrogate_output_vec)[0, [3]]
-
+    
         agent1_surrogate_input_vec = np.array([agent1[3], agent1[4], agent1[10], agent1[9]])
         agent1_surrogate_output_vec = self.surrogate_model.get_pap_model_outputs(agent1_surrogate_input_vec.reshape(1,-1))
         agents_final_output_vec[1, [11, 5]] = np.array(agent1_surrogate_output_vec)[0, [0, 1]]
-
+    
         water_conv = agent2[0] if agent2[0] >= 19.*agent2[2] else 20.*agent2[0]/19.
         agent2_surrogate_input_vec = np.array([water_conv])
         agent2_surrogate_output_vec = self.surrogate_model.get_hyd_model_outputs(agent2_surrogate_input_vec.reshape(1,-1))
         agents_final_output_vec[2, [2, 8, 3, 0]] = np.array(agent2_surrogate_output_vec)[0, [0, 1, 3, 4]]
-
-        return agents_final_output_vec, np.zeros_like(tx_u)
+    
+        # Initialize the physical waste output vector instead of returning a flat zero array
+        agents_waste_final_output_vec = np.zeros_like(tx_u)
+        
+        # Corrected: Populate the generated wastewater (commodity 0, Water) for the APAP industry (Agent 0)
+        # This channels the produced waste directly into self.waste_inv during step_trans()
+        agents_waste_final_output_vec[0, 0] = np.array(agent0_surrogate_output_vec)[0, 3]
+    
+        return agents_final_output_vec, agents_waste_final_output_vec
