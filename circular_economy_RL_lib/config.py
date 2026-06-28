@@ -1,6 +1,6 @@
 import numpy as np
 
-## Settings for the stages
+## Settings for the stages (Leader acts first, then Followers sequence)
 LEADER = 0
 BUYER = 1
 TRANSFORM = 2
@@ -24,14 +24,14 @@ config = {
     'RWD_SCALE': 1e-6,             
     
     # BRL Parameters (Gaur et al. 2025)
-    'lambda_penalty': 0.005,       # Calibrated penalty to prevent systemic shutdown
+    'lambda_penalty': 0.005,       # Calibrated penalty scale to prevent objective dominance
     'lr_leader': 1e-4,             # Slower leader timescale
     'lr_follower': 3e-4,           # Fast follower learning rate
-    'leader_update_frequency': 5,  # Timescale separation interval
+    'leader_update_frequency': 5,  # Alternating epoch timescale ratio
     
     # Training parameters
     'gamma': 0.99,
-    'num_steps': 1000,             
+    'num_steps': 1000,             # Steps per epoch
     'episode_length': 1000,
     'num_epochs': 100,
     'history_length': 5,
