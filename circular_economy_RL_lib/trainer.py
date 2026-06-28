@@ -27,7 +27,11 @@ class BilevelTrainer:
         self.leader_act_dim = 3  
         self.leader_obs_dim = self.num_commodities + 2 # 14
 
-        self.leader_agent = PPOAgent(self.leader_obs_dim, self.leader_act_dim, f"{self.result_folder}/chpkt/leader", lr=self.lr_leader)
+        # Initialize Leader Agent with continuous bounds [0.1, 10.0] matching the active physical envelope
+        self.leader_agent = PPOAgent(
+            self.leader_obs_dim, self.leader_act_dim, f"{self.result_folder}/chpkt/leader", 
+            lr=self.lr_leader, min_val=0.1, max_val=10.0
+        )
         
         # Instantiate separate estimator networks per agent to prevent catastrophic interference
         self.best_response_estimators = [
@@ -35,8 +39,19 @@ class BilevelTrainer:
             for _ in range(self.num_agents)
         ]
         
-        self.buyer_agents = [PPOAgent(self.buyer_obs_dim, self.buyer_act_dim, f"{self.result_folder}/chpkt/buyer_{ag}", lr=self.lr_follower) for ag in range(self.num_agents)]
-        self.trans_agents = [PPOAgent(self.trans_obs_dim, self.trans_act_dim, f"{self.result_folder}/chpkt/trans_{ag}", lr=self.lr_follower) for ag in range(self.num_agents)]
+        # Follower agents maintain standard [0.01, 100.0] action bounds
+        self.buyer_agents = [
+            PPOAgent(
+                self.buyer_obs_dim, self.buyer_act_dim, f"{self.result_folder}/chpkt/buyer_{ag}", 
+                lr=self.lr_follower, min_val=0.01, max_val=100.0
+            ) for ag in range(self.num_agents)
+        ]
+        self.trans_agents = [
+            PPOAgent(
+                self.trans_obs_dim, self.trans_act_dim, f"{self.result_folder}/chpkt/trans_{ag}", 
+                lr=self.lr_follower, min_val=0.01, max_val=100.0
+            ) for ag in range(self.num_agents)
+        ]
 
     def rollout(self):
         batch_obs = [[] for _ in stages]
