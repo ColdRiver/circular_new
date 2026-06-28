@@ -17,8 +17,10 @@ def orthogonal_init(module, gain=nn.init.calculate_gain('relu')):
             nn.init.constant_(module.bias, 0.0)
 
 class Actor(nn.Module):
-    def __init__(self, n_observations, n_actions, hidden_dims=128):
+    def __init__(self, n_observations, n_actions, hidden_dims=128, min_val=0.01, max_val=100.0):
         super(Actor, self).__init__()
+        self.min_val = min_val
+        self.max_val = max_val
         self.layer1 = nn.Linear(n_observations, hidden_dims)
         self.layer2 = nn.Linear(hidden_dims, hidden_dims)
         self.layer3 = nn.Linear(hidden_dims, n_actions)
@@ -33,8 +35,8 @@ class Actor(nn.Module):
         x = F.relu(self.layer2(x))
         x = self.layer3(x)
         
-        # Smooth Sigmoid action mapping preventing dead hard-clamped outputs
-        return torch.sigmoid(x) * 99.99 + 0.01
+        # Corrected: Scale sigmoid output to match the precise environmental boundaries
+        return torch.sigmoid(x) * (self.max_val - self.min_val) + self.min_val
 
 class Critic(nn.Module):
     def __init__(self, n_observations, hidden_dims=128):
@@ -84,8 +86,8 @@ class OptimalFollowerValueEstimator(nn.Module):
         return loss.item()
 
 class PPOAgent:
-    def __init__(self, n_observations, n_actions, chkpt_dir, hidden_dims=128, lr=0.01):
-        self.actor = Actor(n_observations, n_actions, hidden_dims)
+    def __init__(self, n_observations, n_actions, chkpt_dir, hidden_dims=128, lr=0.01, min_val=0.01, max_val=100.0):
+        self.actor = Actor(n_observations, n_actions, hidden_dims, min_val, max_val)
         self.critic = Critic(n_observations, hidden_dims)
         self.actor_optim = optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_optim = optim.Adam(self.critic.parameters(), lr=lr)
