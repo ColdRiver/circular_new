@@ -226,7 +226,10 @@ class Manufacturing_Simulator:
 
         recycled_volume = np.sum(self.waste_actual_d[..., self.t])
         landfilled_volume = np.sum(self.spot_q[..., self.t])
-        freshwater_consumption = np.sum(self.inv[:, 0, self.t])
+        
+        # Corrected: Track the physical freshwater drawn from the spot market (commodity 0 [Water])
+        # instead of the accumulated water inventory, preventing unphysical penalty blowup
+        freshwater_consumption = np.sum(self.spot_q[:, 0, self.t])
         
         leader_reward = recycled_volume - self.active_phi[2] * landfilled_volume - 0.1 * freshwater_consumption
         leader_reward_scaled = leader_reward * self.RWD_SCALE
