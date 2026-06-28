@@ -35,7 +35,7 @@ class Actor(nn.Module):
         x = F.relu(self.layer2(x))
         x = self.layer3(x)
         
-        # Corrected: Scale sigmoid output to match the precise environmental boundaries
+        # Smooth Sigmoid action mapping preventing dead hard-clamped outputs
         return torch.sigmoid(x) * (self.max_val - self.min_val) + self.min_val
 
 class Critic(nn.Module):
@@ -45,7 +45,6 @@ class Critic(nn.Module):
         self.layer2 = nn.Linear(hidden_dims, hidden_dims)
         self.layer3 = nn.Linear(hidden_dims, 1)
         self.apply(orthogonal_init)
-        # Override output layer with a small gain to stabilize early value predictions
         orthogonal_init(self.layer3, gain=0.01)
 
     def forward(self, x):
@@ -84,7 +83,6 @@ class OptimalFollowerValueEstimator(nn.Module):
         
         loss = nn.MSELoss()(predictions, targets)
         loss.backward()
-        # Prevent parameter overshoots by clipping estimator gradients
         nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
         self.optimizer.step()
         return loss.item()
@@ -125,7 +123,7 @@ class PPOAgent:
         entropy = dist.entropy()
         return V, log_probs, entropy
 
-    def learn(self, batch_obs, batch_acts, batch_log_probs, batch_rtgs, n_itr):
+    def learn(self, batch_obs, batch_acts, batch_log_probs, batch_rtgs, n_itr, entropy_coef=0.01):
         V, _, _ = self.evaluate(batch_obs, batch_acts)
         
         # Column-wise (agent-specific) Advantage Normalization preventing gradient suppression
@@ -157,8 +155,8 @@ class PPOAgent:
             surr1 = ratios * b_A_k
             surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * b_A_k
             
-            # Entropy bonus (coef = 0.05) preventing premature local minima convergence
-            actor_loss = (-torch.min(surr1, surr2)).mean() - 0.05 * entropy.mean()
+            # Entropy bonus preventing premature local minima convergence
+            actor_loss = (-torch.min(surr1, surr2)).mean() - entropy_coef * entropy.mean()
             critic_loss = nn.MSELoss()(V, b_rtgs)
             
             self.actor_optim.zero_grad()
