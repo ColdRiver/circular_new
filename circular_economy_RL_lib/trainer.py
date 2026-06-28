@@ -276,7 +276,7 @@ class BilevelTrainer:
             last_idx = self.env.t - 1
             recycled_volume = np.sum(self.env.waste_actual_d[..., last_idx])
             landfilled_volume = np.sum(self.env.spot_q[..., last_idx])
-            freshwater_consumption = np.sum(self.env.inv[:, 0, last_idx])
+            freshwater_consumption = np.sum(self.env.spot_q[:, 0, last_idx])
             
             print("\nPhysical Environmental Flow Scales:")
             print(f"  Wastewater Recycled Volume  : {recycled_volume:.2f}")
