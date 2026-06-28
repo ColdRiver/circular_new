@@ -189,45 +189,26 @@ class BilevelTrainer:
         while i_so_far < self.num_epochs:
             batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens = self.rollout()
             # =================================================================
-            # TARGETED GRADIENT & SHAPE DEBUGGING SCRIPT
+            # LEADER REGULATORY ACTION-CLAMPING DIAGNOSTIC SCRIPT
             # =================================================================
             print("\n" + "="*60)
-            print("          BRL SHAPE & GRADIENT MUTATION TRACKER")
+            print("          BRL LEADER ACTION SPREAD & CLIPPING ANALYSIS")
             print("="*60)
-            
             with torch.no_grad():
-                # Evaluate Leader shapes
-                leader_rtg = batch_rtgs[LEADER]
-                leader_obs = batch_obs[LEADER]
-                leader_V = self.leader_agent.critic(leader_obs / 100.0).squeeze(-1)
+                obs_tensor = batch_obs[LEADER]
+                # Evaluate the raw, un-clipped outputs of the leader actor network
+                mean_phi = self.leader_agent.actor(obs_tensor / 100.0)
                 
-                # Check for silent 2D matrix broadcasting
-                leader_A_k = leader_rtg - leader_V
+                print("Leader Raw Network Outputs:")
+                print(f"  Price Multiplier (phi_0) - Min: {mean_phi[:, 0].min():.4f} | Max: {mean_phi[:, 0].max():.4f} | Mean: {mean_phi[:, 0].mean():.4f}")
+                print(f"  Recycle Subsidy  (phi_1) - Min: {mean_phi[:, 1].min():.4f} | Max: {mean_phi[:, 1].max():.4f} | Mean: {mean_phi[:, 1].mean():.4f}")
+                print(f"  Landfill Tax     (phi_2) - Min: {mean_phi[:, 2].min():.4f} | Max: {mean_phi[:, 2].max():.4f} | Mean: {mean_phi[:, 2].mean():.4f}")
                 
-                print("Leader Tensor Dimensions:")
-                print(f"  Leader RTG Shape       : {list(leader_rtg.shape)}")
-                print(f"  Leader Critic V Shape  : {list(leader_V.shape)}")
-                print(f"  Computed Adv (A_k) Shape: {list(leader_A_k.shape)}")
-                
-                if leader_A_k.dim() > 1 and leader_A_k.shape[-1] != 1:
-                    print("  [CRITICAL DISCREPANCY]: Silent 2D broadcasting detected!")
-                    print(f"  A_k should be 1D, but is currently a 2D matrix of shape {list(leader_A_k.shape)}")
-                else:
-                    print("  [STATUS]: Leader advantages aligned successfully.")
-    
-                # Evaluate Follower shapes (BUYER Stage)
-                buyer_rtg = batch_rtgs[BUYER]
-                buyer_obs = batch_obs[BUYER]
-                buyer_V = torch.stack([
-                    self.buyer_agents[ag].critic(buyer_obs[:, ag, :] / 100.0).squeeze(-1) 
-                    for ag in range(self.num_agents)
-                ], dim=-1)
-                
-                buyer_A_k = buyer_rtg - buyer_V
-                print("\nFollower (Buyer) Tensor Dimensions:")
-                print(f"  Buyer RTG Shape        : {list(buyer_rtg.shape)}")
-                print(f"  Buyer Critic V Shape   : {list(buyer_V.shape)}")
-                print(f"  Computed Adv (A_k) Shape: {list(buyer_A_k.shape)}")
+                # Calculate the percentage of steps where the leader's output is out of bounds
+                clipping_threshold = 10.0
+                clipped_pct = (mean_phi >= clipping_threshold).float().mean(dim=0) * 100.0
+                print(f"\nPercentage of actions trapped in the flat plateau (>= 10.0):")
+                print(f"  phi_0: {clipped_pct[0].item():.2f}% | phi_1: {clipped_pct[1].item():.2f}% | phi_2: {clipped_pct[2].item():.2f}%")
             print("="*60 + "\n")
             # =================================================================
             t_so_far += 1000  # Budgeted step count
