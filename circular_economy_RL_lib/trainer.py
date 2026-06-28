@@ -189,41 +189,45 @@ class BilevelTrainer:
         while i_so_far < self.num_epochs:
             batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens = self.rollout()
             # =================================================================
-            # CRITICAL BRL STABILITY & CONVERGENCE DIAGNOSTICS
+            # TARGETED GRADIENT & SHAPE DEBUGGING SCRIPT
             # =================================================================
             print("\n" + "="*60)
-            print("          BRL CONVERGENCE & EXPLORATION DIAGNOSTICS")
+            print("          BRL SHAPE & GRADIENT MUTATION TRACKER")
             print("="*60)
-    
-            # 1. Check Follower Exploration Standard Deviations (log_std)
-            with torch.no_grad():
-                buyer_stds = [torch.exp(self.buyer_agents[ag].log_std).cpu().numpy() for ag in range(self.num_agents)]
-                trans_stds = [torch.exp(self.trans_agents[ag].log_std).cpu().numpy() for ag in range(self.num_agents)]
-                leader_std = torch.exp(self.leader_agent.log_std).cpu().numpy()
-                
-                print("Exploration Noise (Standard Deviations):")
-                print(f"  Leader Std: {leader_std}")
-                for ag in range(self.num_agents):
-                    print(f"  Buyer Agent {ag} Std (Min/Max/Mean): {buyer_stds[ag].min():.4f} / {buyer_stds[ag].max():.4f} / {buyer_stds[ag].mean():.4f}")
-                    print(f"  Trans Agent {ag} Std (Min/Max/Mean): {trans_stds[ag].min():.4f} / {trans_stds[ag].max():.4f} / {trans_stds[ag].mean():.4f}")
-    
-            # 2. Check Physical Volume Balances in the Environment
-            last_idx = self.env.t - 1
-            recycled_volume = np.sum(self.env.waste_actual_d[..., last_idx])
-            landfilled_volume = np.sum(self.env.spot_q[..., last_idx])
-            freshwater_consumption = np.sum(self.env.inv[:, 0, last_idx])
             
-            print("\nPhysical Environmental Metric Scales:")
-            print(f"  Wastewater Recycled Volume : {recycled_volume:.2f}")
-            print(f"  Wastewater Landfilled Volume: {landfilled_volume:.2f}")
-            print(f"  Freshwater Consumed Volume  : {freshwater_consumption:.2f}")
+            with torch.no_grad():
+                # Evaluate Leader shapes
+                leader_rtg = batch_rtgs[LEADER]
+                leader_obs = batch_obs[LEADER]
+                leader_V = self.leader_agent.critic(leader_obs / 100.0).squeeze(-1)
+                
+                # Check for silent 2D matrix broadcasting
+                leader_A_k = leader_rtg - leader_V
+                
+                print("Leader Tensor Dimensions:")
+                print(f"  Leader RTG Shape       : {list(leader_rtg.shape)}")
+                print(f"  Leader Critic V Shape  : {list(leader_V.shape)}")
+                print(f"  Computed Adv (A_k) Shape: {list(leader_A_k.shape)}")
+                
+                if leader_A_k.dim() > 1 and leader_A_k.shape[-1] != 1:
+                    print("  [CRITICAL DISCREPANCY]: Silent 2D broadcasting detected!")
+                    print(f"  A_k should be 1D, but is currently a 2D matrix of shape {list(leader_A_k.shape)}")
+                else:
+                    print("  [STATUS]: Leader advantages aligned successfully.")
     
-            # 3. Check Active Global Market Rules
-            if self.env.active_phi is not None:
-                print("\nActive Global Market Parameters (phi):")
-                print(f"  Price Multiplier (phi_0) : {self.env.active_phi[0]:.4f}")
-                print(f"  Recycle Subsidy (phi_1)  : {self.env.active_phi[1]:.4f}")
-                print(f"  Landfill Tax (phi_2)     : {self.env.active_phi[2]:.4f}")
+                # Evaluate Follower shapes (BUYER Stage)
+                buyer_rtg = batch_rtgs[BUYER]
+                buyer_obs = batch_obs[BUYER]
+                buyer_V = torch.stack([
+                    self.buyer_agents[ag].critic(buyer_obs[:, ag, :] / 100.0).squeeze(-1) 
+                    for ag in range(self.num_agents)
+                ], dim=-1)
+                
+                buyer_A_k = buyer_rtg - buyer_V
+                print("\nFollower (Buyer) Tensor Dimensions:")
+                print(f"  Buyer RTG Shape        : {list(buyer_rtg.shape)}")
+                print(f"  Buyer Critic V Shape   : {list(buyer_V.shape)}")
+                print(f"  Computed Adv (A_k) Shape: {list(buyer_A_k.shape)}")
             print("="*60 + "\n")
             # =================================================================
             t_so_far += 1000  # Budgeted step count
