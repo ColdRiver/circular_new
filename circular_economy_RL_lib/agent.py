@@ -45,6 +45,8 @@ class Critic(nn.Module):
         self.layer2 = nn.Linear(hidden_dims, hidden_dims)
         self.layer3 = nn.Linear(hidden_dims, 1)
         self.apply(orthogonal_init)
+        # Override output layer with a small gain to stabilize early value predictions
+        orthogonal_init(self.layer3, gain=0.01)
 
     def forward(self, x):
         if isinstance(x, np.ndarray):
@@ -82,6 +84,8 @@ class OptimalFollowerValueEstimator(nn.Module):
         
         loss = nn.MSELoss()(predictions, targets)
         loss.backward()
+        # Prevent parameter overshoots by clipping estimator gradients
+        nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
         self.optimizer.step()
         return loss.item()
 
