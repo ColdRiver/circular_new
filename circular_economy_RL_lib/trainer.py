@@ -267,16 +267,17 @@ class BilevelTrainer:
         while i_so_far < self.num_epochs:
             batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi = self.rollout()
             # =================================================================
-            # LATENT INCONSISTENCIES & REVENUE GRADIANT AUDIT
+            # CORRECTED LATENT INCONSISTENCIES & REVENUE GRADIENT AUDIT
             # =================================================================
             print("\n" + "="*70)
             print("          BRL SYSTEMIC REVENUE & GRADIENT AUDIT (EPOCH {})".format(i_so_far))
             print("="*70)
             with torch.no_grad():
-                # 1. Audit the scale of the Omitted Seller Revenue vs Buyer Costs
-                raw_buyer_rewards = np.array(batch_rews[BUYER][0])  # Shape: (ep_len, 3)
+                # Audit the scale of the Omitted Seller Revenue vs Buyer Costs
+                # We use batch_rtgs[BUYER] to represent the scale of buyer costs/returns
+                buyer_costs_scale = batch_rtgs[BUYER].cpu().numpy() # Shape: (num_total_steps, 3)
                 
-                # Compute physical seller rewards directly from the simulator's states
+                # Compute physical seller rewards directly from the simulator's active states
                 last_idx = self.env.t - 1
                 actual_d = self.env.actual_d[:, :, :, last_idx].sum(axis=0)
                 waste_actual_d = self.env.waste_actual_d[:, :, :, last_idx].sum(axis=0)
@@ -287,12 +288,12 @@ class BilevelTrainer:
                 
                 print("Physical Follower Financial Scale Mismatch:")
                 print(f"  Omitted Seller Revenue per Agent (Epoch End) : {seller_revenue}")
-                print(f"  Active Buyer Costs/Subsidies per Agent (Mean): {np.mean(raw_buyer_rewards, axis=0)}")
+                print(f"  Active Buyer Costs/Subsidies per Agent (Mean): {np.mean(buyer_costs_scale, axis=0)}")
                 
-                # If Seller Revenue is massive compared to Buyer Costs, the followers are missing their main reward signal
-                print(f"  Scale Discrepancy (Omitted Revenue / Buyer Cost): {np.mean(seller_revenue) / (np.mean(np.abs(raw_buyer_rewards)) + 1e-10):.2f}x")
+                # Scale discrepancy ratio
+                print(f"  Scale Discrepancy (Omitted Revenue / Buyer Cost): {np.mean(seller_revenue) / (np.mean(np.abs(buyer_costs_scale)) + 1e-10):.2f}x")
     
-                # 2. Audit the raw gradients of the Estimator Networks
+                # 2. Audit the raw gradients of the Estimator Networks (if any gradient steps occurred)
                 estimator_grad_norms = []
                 for ag in range(self.num_agents):
                     total_norm = 0.0
