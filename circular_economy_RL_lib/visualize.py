@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# Set publication style configurations
+# Set publication-quality style configurations
 plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
 plt.rcParams.update({'font.family': 'sans-serif', 'font.size': 11})
 
@@ -28,9 +28,9 @@ def plot_wastewater_recycled_contribution():
         epochs.append(i)
         
         # Slices Water (index 0) for APAP (Agent 0)
-        # Slices along the third dimension (timestep t) from history_length (5) to the end
-        recycled_water_history = np.sum(data['waste_actual_d'][2, 0, 0, 5:], axis=0)  # Shape: (T,)
-        total_water_inv_history = data['waste_inv'][0, 0, 5:] + 1e-10                # Shape: (T,)
+        # Slices along the fourth dimension (timestep t) from history_length (5) to the end
+        recycled_water_history = data['waste_actual_d'][2, 0, 0, 5:]  # Shape: (T,)
+        total_water_inv_history = data['waste_inv'][0, 0, 5:] + 1e-10   # Shape: (T,)
         
         # Calculate step-by-step percentage contribution
         step_pct_contributions = (recycled_water_history / total_water_inv_history) * 100.0
@@ -60,6 +60,7 @@ def plot_wastewater_recycled_contribution():
 def plot_piot_heatmap():
     """
     Generates Figure 9: PIOT Commodity Transaction Heatmap between Agents for Water/Wastewater.
+    Averages the step-by-step transaction volumes over the active episode.
     """
     file_path = f"{debug_folder}/epoch=100_results.npy"
     if not os.path.exists(file_path):
@@ -78,8 +79,12 @@ def plot_piot_heatmap():
     piot_matrix = np.zeros((3, 3))
     for buyer in range(3):
         for seller in range(3):
-            # Sum P2P exchange + P2P waste transfer for Water (index 0)
-            piot_matrix[buyer, seller] = data['actual_d'][buyer, seller, 0] + data['waste_actual_d'][buyer, seller, 0]
+            # Slices the arrays along the fourth dimension (timestep t) from history_length (5) to the end
+            # and takes the mean over the active steps of the episode to collapse it to a scalar float
+            actual_d_mean = np.mean(data['actual_d'][buyer, seller, 0, 5:])
+            waste_actual_d_mean = np.mean(data['waste_actual_d'][buyer, seller, 0, 5:])
+            
+            piot_matrix[buyer, seller] = actual_d_mean + waste_actual_d_mean
 
     agent_labels = ['PAP (Agent 0)', 'APAP (Agent 1)', 'Green H2 (Agent 2)']
     
