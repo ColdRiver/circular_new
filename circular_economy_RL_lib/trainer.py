@@ -267,27 +267,39 @@ class BilevelTrainer:
         while i_so_far < self.num_epochs:
             batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi = self.rollout()
             # =================================================================
-            # RAW STEP-LEVEL REWARD SCALE AUDITOR
+            # CORRECTED TARGET RETURN SCALE AUDIT (SELF-CONTAINED)
             # =================================================================
             print("\n" + "="*70)
-            print("          BRL STEP-LEVEL REWARD SCALE AUDIT")
+            print("          BRL TARGET RETURN SCALE AUDIT")
             print("="*70)
             with torch.no_grad():
-                # Extract raw step rewards directly from the rollout buffers
-                # batch_rews is the episodic reward list accumulated in rollout()
-                leader_rews = np.array(batch_rews[LEADER])       # (num_episodes, ep_len)
-                buyer_rews = np.array(batch_rews[BUYER])         # (num_episodes, ep_len, 3)
-                trans_rews = np.array(batch_rews[TRANSFORM])     # (num_episodes, ep_len, 3)
+                # Audit the target return scales (batch_rtgs) which are already defined in learn()
+                leader_rtgs = batch_rtgs[LEADER].cpu().numpy()
+                buyer_rtgs = batch_rtgs[BUYER].cpu().numpy()
+                trans_rtgs = batch_rtgs[TRANSFORM].cpu().numpy()
                 
-                print("Step-Level Reward Scales (Mean/Min/Max per step):")
-                print(f"  Leader Reward        - Mean: {leader_rews.mean():.6f} | Min: {leader_rews.min():.6f} | Max: {leader_rews.max():.6f}")
+                print("Discounted Target Return Scales (batch_rtgs):")
+                print(f"  Leader Target        - Mean: {leader_rtgs.mean():.6f} | Min: {leader_rtgs.min():.6f} | Max: {leader_rtgs.max():.6f}")
                 for ag in range(self.num_agents):
-                    print(f"  Buyer {ag} Reward     - Mean: {buyer_rews[:, :, ag].mean():.6f} | Min: {buyer_rews[:, :, ag].min():.6f} | Max: {buyer_rews[:, :, ag].max():.6f}")
-                    print(f"  Transform {ag} Reward - Mean: {trans_rews[:, :, ag].mean():.6f} | Min: {trans_rews[:, :, ag].min():.6f} | Max: {trans_rews[:, :, ag].max():.6f}")
+                    print(f"  Buyer {ag} Target     - Mean: {buyer_rtgs[:, ag].mean():.6f} | Min: {buyer_rtgs[:, ag].min():.6f} | Max: {buyer_rtgs[:, ag].max():.6f}")
+                    print(f"  Transform {ag} Target - Mean: {trans_rtgs[:, ag].mean():.6f} | Min: {trans_rtgs[:, ag].min():.6f} | Max: {trans_rtgs[:, ag].max():.6f}")
                 
                 # Check for scale discrepancies that cause estimator parameter explosion
-                discrepancy_ratio = trans_rews[:, :, 2].std() / (buyer_rews[:, :, 0].std() + 1e-10)
-                print(f"\n  Reward Variance Discrepancy (Hyd Trans / PAP Buyer): {discrepancy_ratio:.2f}x")
+                discrepancy_ratio = trans_rtgs[:, 2].std() / (buyer_rtgs[:, 0].std() + 1e-10)
+                print(f"\n  Advantage/Target Variance Discrepancy (Hyd Trans / PAP Buyer): {discrepancy_ratio:.2f}x")
+    
+                # Audit the raw gradients of the Estimator Networks (if any gradient steps occurred)
+                estimator_grad_norms = []
+                for ag in range(self.num_agents):
+                    total_norm = 0.0
+                    for p in self.best_response_estimators[ag].parameters():
+                        if p.grad is not None:
+                            total_norm += p.grad.data.norm(2).item() ** 2
+                    estimator_grad_norms.append(total_norm ** 0.5)
+                
+                print("\nEstimator Gradient Tracking:")
+                for ag in range(self.num_agents):
+                    print(f"  Estimator {ag} Active Gradient Norm: {estimator_grad_norms[ag]:.4f}")
             print("="*70 + "\n")
             # =================================================================
             t_so_far += 1000  # Budgeted step count
