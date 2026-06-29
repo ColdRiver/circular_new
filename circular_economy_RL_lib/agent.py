@@ -33,10 +33,8 @@ class Actor(nn.Module):
             x = torch.tensor(x, dtype=torch.float32)
         x = F.relu(self.layer1(x))
         x = F.relu(self.layer2(x))
-        x = self.layer3(x)
-        
-        # Smooth Sigmoid action mapping preventing dead hard-clamped outputs
-        return torch.sigmoid(x) * (self.max_val - self.min_val) + self.min_val
+        # Unbounded output allowing standard continuous Gaussian policy optimization
+        return self.layer3(x)
 
 class Critic(nn.Module):
     def __init__(self, n_observations, hidden_dims=128):
@@ -108,9 +106,13 @@ class PPOAgent:
         cov_mat = torch.diag(std ** 2)
         
         dist = MultivariateNormal(mean, cov_mat)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-        return np.maximum(action.detach().numpy(), 0.01), log_prob.detach().numpy()
+        raw_action = dist.sample()
+        log_prob = dist.log_prob(raw_action)
+        
+        # Apply Sigmoid bounding transformation to the sampled raw action right before execution
+        action = torch.sigmoid(raw_action) * (self.actor.max_val - self.actor.min_val) + self.actor.min_val
+        
+        return action.detach().numpy(), raw_action.detach().numpy(), log_prob.detach().numpy()
 
     def evaluate(self, batch_obs, batch_acts):
         V = self.critic(batch_obs).squeeze()
@@ -119,6 +121,7 @@ class PPOAgent:
         cov_mat = torch.diag(std ** 2)
         
         dist = MultivariateNormal(mean, cov_mat)
+        # Evaluates log-probabilities of raw actions in the unconstrained space
         log_probs = dist.log_prob(batch_acts)
         entropy = dist.entropy()
         return V, log_probs, entropy
