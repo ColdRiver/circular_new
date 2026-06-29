@@ -269,42 +269,6 @@ class BilevelTrainer:
             # Unpack the 8th element (batch_rews)
             batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi, batch_rews = self.rollout()
             
-            # =================================================================
-            # CORRECTED TARGET RETURN SCALE AUDIT (SELF-CONTAINED)
-            # =================================================================
-            print("\n" + "="*70)
-            print("          BRL TARGET RETURN SCALE AUDIT")
-            print("="*70)
-            with torch.no_grad():
-                # Audit the target return scales (batch_rtgs) which are already defined in learn()
-                leader_rtgs = batch_rtgs[LEADER].cpu().numpy()
-                buyer_rtgs = batch_rtgs[BUYER].cpu().numpy()
-                trans_rtgs = batch_rtgs[TRANSFORM].cpu().numpy()
-                
-                print("Discounted Target Return Scales (batch_rtgs):")
-                print(f"  Leader Target        - Mean: {leader_rtgs.mean():.6f} | Min: {leader_rtgs.min():.6f} | Max: {leader_rtgs.max():.6f}")
-                for ag in range(self.num_agents):
-                    print(f"  Buyer {ag} Target     - Mean: {buyer_rtgs[:, ag].mean():.6f} | Min: {buyer_rtgs[:, ag].min():.6f} | Max: {buyer_rtgs[:, ag].max():.6f}")
-                    print(f"  Transform {ag} Target - Mean: {trans_rtgs[:, ag].mean():.6f} | Min: {trans_rtgs[:, ag].min():.6f} | Max: {trans_rtgs[:, ag].max():.6f}")
-                
-                # Check for scale discrepancies that cause estimator parameter explosion
-                discrepancy_ratio = trans_rtgs[:, 2].std() / (buyer_rtgs[:, 0].std() + 1e-10)
-                print(f"\n  Advantage/Target Variance Discrepancy (Hyd Trans / PAP Buyer): {discrepancy_ratio:.2f}x")
-    
-                # Audit the raw gradients of the Estimator Networks (if any gradient steps occurred)
-                estimator_grad_norms = []
-                for ag in range(self.num_agents):
-                    total_norm = 0.0
-                    for p in self.best_response_estimators[ag].parameters():
-                        if p.grad is not None:
-                            total_norm += p.grad.data.norm(2).item() ** 2
-                    estimator_grad_norms.append(total_norm ** 0.5)
-                
-                print("\nEstimator Gradient Tracking:")
-                for ag in range(self.num_agents):
-                    print(f"  Estimator {ag} Active Gradient Norm: {estimator_grad_norms[ag]:.4f}")
-            print("="*70 + "\n")
-            # =================================================================
             t_so_far += 1000  # Budgeted step count
             i_so_far += 1
 
