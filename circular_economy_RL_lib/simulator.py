@@ -3,6 +3,15 @@ from config import config, init_historical_data
 from surrogate_models import SurrogateModel
 
 class Manufacturing_Simulator:
+    """
+    Bilevel Environment Class with Temporal Price Inertia
+    -- reset: returns the global leader state and decentralized follower states
+    -- step_sell: receives raw phi, filters it via a low-pass filter, and establishes prices
+    -- get_buyer_state: constructs the 1908-dimension state vector for step 2 buyers
+    -- step_buy: computes P2P transactions and returns follower rewards (buying + selling)
+    -- get_trans_state: constructs the 2088-dimension state vector for step 3 transformers
+    -- step_trans: evaluates non-linear surrogate networks and transitions inventories
+    """
     def __init__(self):
         for key, value in config.items():
             setattr(self, key, value)
@@ -51,12 +60,18 @@ class Manufacturing_Simulator:
         return self.get_leader_state(), self.get_follower_state()
     
     def get_leader_state(self):
+        """
+        Upper-level state reflecting macro-environmental performance (14 dimensions)
+        """
         avg_spot = np.mean(self.spot_price[:, self.t-self.history_length:self.t], axis=1)
         total_waste_landfilled = np.sum(self.spot_q[:, :, self.t-1]) if self.t > self.history_length else 0.
         total_freshwater = np.sum(self.inv[:, 0, self.t])
         return np.concatenate((avg_spot, [total_waste_landfilled, total_freshwater]))
 
     def get_follower_state(self):
+        """
+        Decentralized follower state tracking localized inventories and physical dynamics (1824 dimensions)
+        """
         follower_states = []
         start_time = self.t - self.history_length
         for n in range(self.num_agents):
@@ -87,6 +102,9 @@ class Manufacturing_Simulator:
         return np.array(follower_states)
 
     def get_buyer_state(self, s_follower):
+        """
+        Constructs the 1908-dimension state vector for step 2 buyers
+        """
         buyer_states = []
         for n in range(self.num_agents):
             state_flat = s_follower[n]
@@ -100,15 +118,21 @@ class Manufacturing_Simulator:
         return np.array(buyer_states)
 
     def get_trans_state(self, s_buyer):
+        """
+        Constructs the 2088-dimension state vector for step 3 transformers
+        Slices all transaction arrays strictly at the current simulation round self.t
+        """
         trans_states = []
         for n in range(self.num_agents):
             state_flat = s_buyer[n]
             
+            # Sliced current step buyer decisions (total size 84)
             q_flat = self.q[n, :, :, self.t].flatten()               
             waste_q_flat = self.waste_q[n, :, :, self.t].flatten()   
             spot_q_flat = self.spot_q[n, :, self.t].flatten()     
             state_flat = np.concatenate([state_flat, q_flat, waste_q_flat, spot_q_flat])
             
+            # Sliced current step physical responses (total size 96)
             actual_d_flat = self.actual_d[n, :, :, self.t].flatten()             
             waste_actual_d_flat = self.waste_actual_d[n, :, :, self.t].flatten() 
             inv_buy_flat = self.inv_buy[n, :, self.t].flatten()               
@@ -125,7 +149,6 @@ class Manufacturing_Simulator:
         """
         raw_phi = np.clip(orig_leader_action, 0.1, 10.0)
         
-        # Low-pass filter (Exponential Moving Average)
         alpha_smooth = 0.05
         if self.active_phi is None:
             self.active_phi = raw_phi
@@ -138,7 +161,21 @@ class Manufacturing_Simulator:
             
         return self.get_follower_state()
 
+    def get_seller_reward(self):
+        """
+        Computes the selling revenues of each of the 3 industries
+        """
+        actual_d = self.actual_d[:, :, :, self.t].sum(axis=0)
+        waste_actual_d = self.waste_actual_d[:, :, :, self.t].sum(axis=0)
+
+        reward = (self.price[:, :, self.t] * actual_d).sum(axis=1)
+        reward += (self.waste_price[:, :, self.t] * waste_actual_d).sum(axis=1)
+        return reward * self.RWD_SCALE
+
     def step_buy(self, orig_buyer_actions):
+        """
+        Phase 2: Followers execute buying actions under active market rules (phi)
+        """
         keys = ['q', 'waste_q', 'spot_q']
         nc = (self.num_agents - 1) * self.num_commodities
         lengths = [nc, nc, self.num_commodities]
@@ -191,9 +228,19 @@ class Manufacturing_Simulator:
             
             buyer_rewards.append(reward * self.RWD_SCALE)
 
+        # Corrected: Retrieve the omitted selling revenue (revenue earned by selling commodities and waste)
+        # and add it directly to buyer_rewards. This ensures the followers realize that trading waste
+        # and recycling is highly profitable, encouraging P2P exchange.
+        seller_rewards = self.get_seller_reward()
+        for n in range(self.num_agents):
+            buyer_rewards[n] += seller_rewards[n]
+
         return np.array(buyer_rewards)
 
     def step_trans(self, orig_trans_actions):
+        """
+        Phase 3: Followers execute manufacturing & transformation steps
+        """
         keys = ['tx_u', 'eco_u']
         key_len_dict = {k: self.num_commodities for k in keys}
         
@@ -222,6 +269,8 @@ class Manufacturing_Simulator:
         trans_rewards = []
         for n in range(self.num_agents):
             r = np.sum(self.eco_u[n, :, self.t] * uc_p) - np.sum(self.tx_u[n, :, self.t] * tx_p)
+            if n == 2:  # Corrected: Scale Green H2 (Agent 2) down by 100x to align its scale with PAP and APAP
+                r = r * 0.01
             trans_rewards.append(r * self.RWD_SCALE)
 
         recycled_volume = np.sum(self.waste_actual_d[..., self.t])
@@ -232,8 +281,6 @@ class Manufacturing_Simulator:
         # This removes the leader's incentive to artificially lower the tax (phi_2) to protect its reward,
         # forcing it to raise phi_2 to maximum to compel the followers to recycle.
         leader_reward = recycled_volume - 1.0 * landfilled_volume - 0.1 * freshwater_consumption
-        
-        leader_reward = recycled_volume - self.active_phi[2] * landfilled_volume - 0.1 * freshwater_consumption
         leader_reward_scaled = leader_reward * self.RWD_SCALE
 
         self.t += 1
@@ -263,27 +310,27 @@ class Manufacturing_Simulator:
         agent0 = tx_u[0]
         agent1 = tx_u[1]
         agent2 = tx_u[2]
-    
+
         agents_final_output_vec = np.zeros_like(tx_u)
         agent0_surrogate_input_vec = np.array([agent0[5], agent0[7], agent0[2], agent0[0], agent0[1]])
         agent0_surrogate_output_vec = self.surrogate_model.get_apap_model_outputs(agent0_surrogate_input_vec.reshape(1,-1))
         agents_final_output_vec[0, [2, 6, 0]] = np.array(agent0_surrogate_output_vec)[0, [0, 1, 3]]
         self.wastewater[:, :, self.t] = np.array(agent0_surrogate_output_vec)[0, [3]]
-    
+
         agent1_surrogate_input_vec = np.array([agent1[3], agent1[4], agent1[10], agent1[9]])
         agent1_surrogate_output_vec = self.surrogate_model.get_pap_model_outputs(agent1_surrogate_input_vec.reshape(1,-1))
         agents_final_output_vec[1, [11, 5]] = np.array(agent1_surrogate_output_vec)[0, [0, 1]]
-    
+
         water_conv = agent2[0] if agent2[0] >= 19.*agent2[2] else 20.*agent2[0]/19.
         agent2_surrogate_input_vec = np.array([water_conv])
         agent2_surrogate_output_vec = self.surrogate_model.get_hyd_model_outputs(agent2_surrogate_input_vec.reshape(1,-1))
         agents_final_output_vec[2, [2, 8, 3, 0]] = np.array(agent2_surrogate_output_vec)[0, [0, 1, 3, 4]]
-    
-        # Initialize the physical waste output vector instead of returning a flat zero array
+
+        # Initialize the physical waste output vector
         agents_waste_final_output_vec = np.zeros_like(tx_u)
         
         # Corrected: Populate the generated wastewater (commodity 0, Water) for the APAP industry (Agent 0)
         # This channels the produced waste directly into self.waste_inv during step_trans()
         agents_waste_final_output_vec[0, 0] = np.array(agent0_surrogate_output_vec)[0, 3]
-    
+
         return agents_final_output_vec, agents_waste_final_output_vec
