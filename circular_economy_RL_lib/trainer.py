@@ -267,44 +267,27 @@ class BilevelTrainer:
         while i_so_far < self.num_epochs:
             batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi = self.rollout()
             # =================================================================
-            # CORRECTED LATENT INCONSISTENCIES & REVENUE GRADIENT AUDIT
+            # RAW STEP-LEVEL REWARD SCALE AUDITOR
             # =================================================================
             print("\n" + "="*70)
-            print("          BRL SYSTEMIC REVENUE & GRADIENT AUDIT (EPOCH {})".format(i_so_far))
+            print("          BRL STEP-LEVEL REWARD SCALE AUDIT")
             print("="*70)
             with torch.no_grad():
-                # Audit the scale of the Omitted Seller Revenue vs Buyer Costs
-                # We use batch_rtgs[BUYER] to represent the scale of buyer costs/returns
-                buyer_costs_scale = batch_rtgs[BUYER].cpu().numpy() # Shape: (num_total_steps, 3)
+                # Extract raw step rewards directly from the rollout buffers
+                # batch_rews is the episodic reward list accumulated in rollout()
+                leader_rews = np.array(batch_rews[LEADER])       # (num_episodes, ep_len)
+                buyer_rews = np.array(batch_rews[BUYER])         # (num_episodes, ep_len, 3)
+                trans_rews = np.array(batch_rews[TRANSFORM])     # (num_episodes, ep_len, 3)
                 
-                # Compute physical seller rewards directly from the simulator's active states
-                last_idx = self.env.t - 1
-                actual_d = self.env.actual_d[:, :, :, last_idx].sum(axis=0)
-                waste_actual_d = self.env.waste_actual_d[:, :, :, last_idx].sum(axis=0)
-                
-                # Unscaled selling revenue earned by each industry
-                seller_revenue_unscaled = (self.env.price[:, :, last_idx] * actual_d).sum(axis=1) + (self.env.waste_price[:, :, last_idx] * waste_actual_d).sum(axis=1)
-                seller_revenue = seller_revenue_unscaled * self.env.RWD_SCALE
-                
-                print("Physical Follower Financial Scale Mismatch:")
-                print(f"  Omitted Seller Revenue per Agent (Epoch End) : {seller_revenue}")
-                print(f"  Active Buyer Costs/Subsidies per Agent (Mean): {np.mean(buyer_costs_scale, axis=0)}")
-                
-                # Scale discrepancy ratio
-                print(f"  Scale Discrepancy (Omitted Revenue / Buyer Cost): {np.mean(seller_revenue) / (np.mean(np.abs(buyer_costs_scale)) + 1e-10):.2f}x")
-    
-                # 2. Audit the raw gradients of the Estimator Networks (if any gradient steps occurred)
-                estimator_grad_norms = []
+                print("Step-Level Reward Scales (Mean/Min/Max per step):")
+                print(f"  Leader Reward        - Mean: {leader_rews.mean():.6f} | Min: {leader_rews.min():.6f} | Max: {leader_rews.max():.6f}")
                 for ag in range(self.num_agents):
-                    total_norm = 0.0
-                    for p in self.best_response_estimators[ag].parameters():
-                        if p.grad is not None:
-                            total_norm += p.grad.data.norm(2).item() ** 2
-                    estimator_grad_norms.append(total_norm ** 0.5)
+                    print(f"  Buyer {ag} Reward     - Mean: {buyer_rews[:, :, ag].mean():.6f} | Min: {buyer_rews[:, :, ag].min():.6f} | Max: {buyer_rews[:, :, ag].max():.6f}")
+                    print(f"  Transform {ag} Reward - Mean: {trans_rews[:, :, ag].mean():.6f} | Min: {trans_rews[:, :, ag].min():.6f} | Max: {trans_rews[:, :, ag].max():.6f}")
                 
-                print("\nEstimator Gradient Tracking:")
-                for ag in range(self.num_agents):
-                    print(f"  Estimator {ag} Active Gradient Norm: {estimator_grad_norms[ag]:.4f}")
+                # Check for scale discrepancies that cause estimator parameter explosion
+                discrepancy_ratio = trans_rews[:, :, 2].std() / (buyer_rews[:, :, 0].std() + 1e-10)
+                print(f"\n  Reward Variance Discrepancy (Hyd Trans / PAP Buyer): {discrepancy_ratio:.2f}x")
             print("="*70 + "\n")
             # =================================================================
             t_so_far += 1000  # Budgeted step count
