@@ -256,6 +256,35 @@ class BilevelTrainer:
 
         while i_so_far < self.num_epochs:
             batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi = self.rollout()
+            # =================================================================
+            # BRL EXPLORATION NOISE & ACTION SPREAD DIAGNOSTICS
+            # =================================================================
+            print("\n" + "="*70)
+            print("          BRL POLICY NOISE TO ACTION SCALE RATIO AUDIT (EPOCH {})".format(i_so_far))
+            print("="*70)
+            with torch.no_grad():
+                # Check the raw output standard deviations of PPO policies relative to action scales
+                leader_std = torch.exp(self.leader_agent.log_std).cpu().numpy()
+                buyer_stds = [torch.exp(self.buyer_agents[ag].log_std).cpu().numpy() for ag in range(self.num_agents)]
+                
+                print("Policy Noise Scales relative to Action Boundaries:")
+                print(f"  Leader action range: [0.1, 10.0]  | Policy Std: {leader_std}")
+                print(f"  Leader Action-to-Noise Ratio (Max Range / Std Mean): {9.9 / np.mean(leader_std):.2f}")
+                
+                for ag in range(self.num_agents):
+                    b_std_mean = buyer_stds[ag].mean()
+                    # If this ratio is extremely high, it confirms exploration is mathematically blocked
+                    print(f"  Buyer {ag} action range: [0.01, 100.0] | Policy Std Mean: {b_std_mean:.4f}")
+                    print(f"  Buyer {ag} Action-to-Noise Ratio (Max Range / Std Mean): {99.99 / b_std_mean:.2f}")
+    
+                # Check actual executed action ranges during the rollout
+                flat_buyer_acts = batch_acts[BUYER].cpu().numpy().reshape(-1, self.buyer_act_dim)
+                print("\nRollout Action Spread Analysis (BUYER stage):")
+                for ag in range(self.num_agents):
+                    ag_acts = flat_buyer_acts[:, ag * self.buyer_act_dim // self.num_agents : (ag + 1) * self.buyer_act_dim // self.num_agents]
+                    print(f"  Agent {ag} executed actions - Min: {ag_acts.min():.4f} | Max: {ag_acts.max():.4f} | Mean: {ag_acts.mean():.4f}")
+            print("="*70 + "\n")
+            # =================================================================
             t_so_far += 1000  # Budgeted step count
             i_so_far += 1
 
