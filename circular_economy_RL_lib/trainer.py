@@ -64,6 +64,7 @@ class BilevelTrainer:
         self.leader_act_dim = 3  
         self.leader_obs_dim = self.num_commodities + 2 # 14
 
+        # Enforces tight leader bounds matching the physical simulator boundaries
         self.leader_agent = PPOAgent(
             self.leader_obs_dim, self.leader_act_dim, f"{self.result_folder}/chpkt/leader", 
             lr=self.lr_leader, min_val=0.1, max_val=10.0
@@ -75,6 +76,7 @@ class BilevelTrainer:
             for _ in range(self.num_agents)
         ]
         
+        # Follower agents maintain standard action bounds
         self.buyer_agents = [
             PPOAgent(
                 self.buyer_obs_dim, self.buyer_act_dim, f"{self.result_folder}/chpkt/buyer_{ag}", 
@@ -118,11 +120,11 @@ class BilevelTrainer:
                 self.leader_rms.update(s_leader)
                 s_leader_norm = self.leader_rms.normalize(s_leader)
                 
-                phi, log_p_leader = self.leader_agent.get_action(s_leader_norm)
-                batch_acts[LEADER].append(phi)
+                phi_bounded, raw_phi, log_p_leader = self.leader_agent.get_action(s_leader_norm)
+                batch_acts[LEADER].append(raw_phi)  # Store raw action for PPO updates
                 batch_log_probs[LEADER].append(log_p_leader)
                 
-                s_follower = self.env.step_sell(phi)
+                s_follower = self.env.step_sell(phi_bounded)  # Pass bounded action to environment
                 
                 # Track the active smoothed market parameters (phi_active)
                 batch_active_phi.append(self.env.active_phi)
@@ -136,14 +138,17 @@ class BilevelTrainer:
                 s_buyer_norm = self.buyer_rms.normalize(s_buyer)
                 
                 buyer_actions = []
+                buyer_raw_actions = []
                 log_p_buyers = []
                 for ag in range(self.num_agents):
-                    act_b, log_p_b = self.buyer_agents[ag].get_action(s_buyer_norm[ag])
-                    buyer_actions.append(act_b)
+                    act_b_bounded, raw_b_act, log_p_b = self.buyer_agents[ag].get_action(s_buyer_norm[ag])
+                    buyer_actions.append(act_b_bounded)
+                    buyer_raw_actions.append(raw_b_act)
                     log_p_buyers.append(log_p_b)
                 
                 buyer_actions = np.array(buyer_actions)
-                batch_acts[BUYER].append(buyer_actions)
+                buyer_raw_actions = np.array(buyer_raw_actions)
+                batch_acts[BUYER].append(buyer_raw_actions)  # Store raw actions for PPO updates
                 batch_log_probs[BUYER].append(log_p_buyers)
 
                 rew_b = self.env.step_buy(buyer_actions)
@@ -156,14 +161,17 @@ class BilevelTrainer:
                 s_trans_norm = self.trans_rms.normalize(s_trans)
                 
                 trans_actions = []
+                trans_raw_actions = []
                 log_p_trans = []
                 for ag in range(self.num_agents):
-                    act_t, log_p_t = self.trans_agents[ag].get_action(s_trans_norm[ag])
-                    trans_actions.append(act_t)
+                    act_t_bounded, raw_t_act, log_p_t = self.trans_agents[ag].get_action(s_trans_norm[ag])
+                    trans_actions.append(act_t_bounded)
+                    trans_raw_actions.append(raw_t_act)
                     log_p_trans.append(log_p_t)
                 
                 trans_actions = np.array(trans_actions)
-                batch_acts[TRANSFORM].append(trans_actions)
+                trans_raw_actions = np.array(trans_raw_actions)
+                batch_acts[TRANSFORM].append(trans_raw_actions)  # Store raw actions for PPO updates
                 batch_log_probs[TRANSFORM].append(log_p_trans)
 
                 s_leader_next, s_follower_next, rew_t, rew_l, done = self.env.step_trans(trans_actions)
@@ -187,6 +195,7 @@ class BilevelTrainer:
         tensor_acts = [torch.tensor(np.array(act), dtype=torch.float) for act in batch_acts]
         tensor_log_probs = [torch.tensor(np.array(lp), dtype=torch.float) for lp in batch_log_probs]
 
+        # Evaluate GAE-Lambda returns
         batch_rtgs, batch_rets = self.compute_rtgs(batch_obs, batch_rews, batch_lens)
         return tensor_obs, tensor_acts, tensor_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi
 
@@ -233,7 +242,7 @@ class BilevelTrainer:
                 vals = V_episodes[ep]
                 
                 advantages = np.zeros_like(rews)
-                gae = np.zeros_like(rews[0])
+                gae = np.zeros_like(rews[0])  # Adapts automatically to scalar or vector shapes
                 
                 for t in reversed(range(len(rews))):
                     next_val = vals[t+1] if t + 1 < len(rews) else np.zeros_like(rews[0])
@@ -254,37 +263,9 @@ class BilevelTrainer:
         t_so_far = 0
         i_so_far = 0
 
+        # Strict epoch-based outer loop constraint guaranteeing exactly num_epochs execution
         while i_so_far < self.num_epochs:
             batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi = self.rollout()
-            # =================================================================
-            # BRL EXPLORATION NOISE & ACTION SPREAD DIAGNOSTICS
-            # =================================================================
-            print("\n" + "="*70)
-            print("          BRL POLICY NOISE TO ACTION SCALE RATIO AUDIT (EPOCH {})".format(i_so_far))
-            print("="*70)
-            with torch.no_grad():
-                # Check the raw output standard deviations of PPO policies relative to action scales
-                leader_std = torch.exp(self.leader_agent.log_std).cpu().numpy()
-                buyer_stds = [torch.exp(self.buyer_agents[ag].log_std).cpu().numpy() for ag in range(self.num_agents)]
-                
-                print("Policy Noise Scales relative to Action Boundaries:")
-                print(f"  Leader action range: [0.1, 10.0]  | Policy Std: {leader_std}")
-                print(f"  Leader Action-to-Noise Ratio (Max Range / Std Mean): {9.9 / np.mean(leader_std):.2f}")
-                
-                for ag in range(self.num_agents):
-                    b_std_mean = buyer_stds[ag].mean()
-                    # If this ratio is extremely high, it confirms exploration is mathematically blocked
-                    print(f"  Buyer {ag} action range: [0.01, 100.0] | Policy Std Mean: {b_std_mean:.4f}")
-                    print(f"  Buyer {ag} Action-to-Noise Ratio (Max Range / Std Mean): {99.99 / b_std_mean:.2f}")
-    
-                # Check actual executed action ranges during the rollout
-                flat_buyer_acts = batch_acts[BUYER].cpu().numpy().reshape(-1, self.buyer_act_dim)
-                print("\nRollout Action Spread Analysis (BUYER stage):")
-                for ag in range(self.num_agents):
-                    ag_acts = flat_buyer_acts[:, ag * self.buyer_act_dim // self.num_agents : (ag + 1) * self.buyer_act_dim // self.num_agents]
-                    print(f"  Agent {ag} executed actions - Min: {ag_acts.min():.4f} | Max: {ag_acts.max():.4f} | Mean: {ag_acts.mean():.4f}")
-            print("="*70 + "\n")
-            # =================================================================
             t_so_far += 1000  # Budgeted step count
             i_so_far += 1
 
@@ -318,7 +299,6 @@ class BilevelTrainer:
                 self.writer.add_scalar(f'trans_critic_loss_agent_{ag}', c_loss_t, t_so_far)
 
             # --- Update Best-Response Value Estimators ---
-            # Train estimators on active, smoothed market parameters to prevent functional collapse
             flat_active_phi = torch.tensor(np.array(batch_active_phi), dtype=torch.float32).reshape(-1, self.leader_act_dim).to(batch_obs[BUYER].device)
             for ag in range(self.num_agents):
                 flat_state_norm = norm_obs_buyer[:, ag]
