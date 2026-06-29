@@ -266,6 +266,46 @@ class BilevelTrainer:
         # Strict epoch-based outer loop constraint guaranteeing exactly num_epochs execution
         while i_so_far < self.num_epochs:
             batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi = self.rollout()
+            # =================================================================
+            # LATENT INCONSISTENCIES & REVENUE GRADIANT AUDIT
+            # =================================================================
+            print("\n" + "="*70)
+            print("          BRL SYSTEMIC REVENUE & GRADIENT AUDIT (EPOCH {})".format(i_so_far))
+            print("="*70)
+            with torch.no_grad():
+                # 1. Audit the scale of the Omitted Seller Revenue vs Buyer Costs
+                raw_buyer_rewards = np.array(batch_rews[BUYER][0])  # Shape: (ep_len, 3)
+                
+                # Compute physical seller rewards directly from the simulator's states
+                last_idx = self.env.t - 1
+                actual_d = self.env.actual_d[:, :, :, last_idx].sum(axis=0)
+                waste_actual_d = self.env.waste_actual_d[:, :, :, last_idx].sum(axis=0)
+                
+                # Unscaled selling revenue earned by each industry
+                seller_revenue_unscaled = (self.env.price[:, :, last_idx] * actual_d).sum(axis=1) + (self.env.waste_price[:, :, last_idx] * waste_actual_d).sum(axis=1)
+                seller_revenue = seller_revenue_unscaled * self.env.RWD_SCALE
+                
+                print("Physical Follower Financial Scale Mismatch:")
+                print(f"  Omitted Seller Revenue per Agent (Epoch End) : {seller_revenue}")
+                print(f"  Active Buyer Costs/Subsidies per Agent (Mean): {np.mean(raw_buyer_rewards, axis=0)}")
+                
+                # If Seller Revenue is massive compared to Buyer Costs, the followers are missing their main reward signal
+                print(f"  Scale Discrepancy (Omitted Revenue / Buyer Cost): {np.mean(seller_revenue) / (np.mean(np.abs(raw_buyer_rewards)) + 1e-10):.2f}x")
+    
+                # 2. Audit the raw gradients of the Estimator Networks
+                estimator_grad_norms = []
+                for ag in range(self.num_agents):
+                    total_norm = 0.0
+                    for p in self.best_response_estimators[ag].parameters():
+                        if p.grad is not None:
+                            total_norm += p.grad.data.norm(2).item() ** 2
+                    estimator_grad_norms.append(total_norm ** 0.5)
+                
+                print("\nEstimator Gradient Tracking:")
+                for ag in range(self.num_agents):
+                    print(f"  Estimator {ag} Active Gradient Norm: {estimator_grad_norms[ag]:.4f}")
+            print("="*70 + "\n")
+            # =================================================================
             t_so_far += 1000  # Budgeted step count
             i_so_far += 1
 
