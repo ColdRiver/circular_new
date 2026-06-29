@@ -355,15 +355,13 @@ class BilevelTrainer:
             raw_leader_return = np.mean([np.sum(ep) for ep in batch_rews[LEADER]])
             debug_folder = self.result_folder + '/debug'
             
-            # Corrected: Define last_idx to safely retrieve the final active timestep of the rollout
-            last_idx = self.env.t - 1
-            
             curr_epoch_results_dict = {
-                'actual_d': self.env.actual_d[..., last_idx],
-                'waste_actual_d': self.env.waste_actual_d[..., last_idx],
-                'spot_q': self.env.spot_q[..., last_idx],
-                'inv': self.env.inv[..., last_idx],
-                'waste_inv': self.env.waste_inv[..., last_idx],
+                # Save the entire, un-sliced arrays to allow accurate episode-wide average plotting
+                'actual_d': self.env.actual_d,
+                'waste_actual_d': self.env.waste_actual_d,
+                'spot_q': self.env.spot_q,
+                'inv': self.env.inv,
+                'waste_inv': self.env.waste_inv,
                 'raw_leader_return': raw_leader_return,
                 'buyer_avg_return': np.mean(batch_rets[BUYER]),
                 'trans_avg_return': np.mean(batch_rets[TRANSFORM])
