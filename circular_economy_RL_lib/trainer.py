@@ -355,6 +355,9 @@ class BilevelTrainer:
             raw_leader_return = np.mean([np.sum(ep) for ep in batch_rews[LEADER]])
             debug_folder = self.result_folder + '/debug'
             
+            # Corrected: Define last_idx to safely retrieve the final active timestep of the rollout
+            last_idx = self.env.t - 1
+            
             curr_epoch_results_dict = {
                 'actual_d': self.env.actual_d[..., last_idx],
                 'waste_actual_d': self.env.waste_actual_d[..., last_idx],
