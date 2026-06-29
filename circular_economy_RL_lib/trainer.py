@@ -197,7 +197,8 @@ class BilevelTrainer:
 
         # Evaluate GAE-Lambda returns
         batch_rtgs, batch_rets = self.compute_rtgs(batch_obs, batch_rews, batch_lens)
-        return tensor_obs, tensor_acts, tensor_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi
+        # Added batch_rews to the return tuple to allow unpenalized reward tracking in learn()
+        return tensor_obs, tensor_acts, tensor_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi, batch_rews
 
     def compute_rtgs(self, batch_obs, batch_rews, batch_lens):
         """
@@ -265,7 +266,9 @@ class BilevelTrainer:
 
         # Strict epoch-based outer loop constraint guaranteeing exactly num_epochs execution
         while i_so_far < self.num_epochs:
-            batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi = self.rollout()
+            # Unpack the 8th element (batch_rews)
+            batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi, batch_rews = self.rollout()
+            
             # =================================================================
             # CORRECTED TARGET RETURN SCALE AUDIT (SELF-CONTAINED)
             # =================================================================
