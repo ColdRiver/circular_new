@@ -382,3 +382,20 @@ class BilevelTrainer:
             self.writer.add_scalar('trans_avg_return', np.mean(batch_rets[TRANSFORM]), t_so_far)
             
             print(f"Epoch {i_so_far}/{self.num_epochs} Done. Leader Return: {np.mean(batch_rets[LEADER]):.5f}")
+            # =================================================================
+            # SAVE EPOCH PHYSICAL METRICS FOR PAPER-LEVEL PLOTTING
+            # =================================================================
+            raw_leader_return = np.mean([np.sum(ep) for ep in batch_rews[LEADER]])
+            debug_folder = self.result_folder + '/debug'
+            
+            curr_epoch_results_dict = {
+                'actual_d': self.env.actual_d[..., last_idx],
+                'waste_actual_d': self.env.waste_actual_d[..., last_idx],
+                'spot_q': self.env.spot_q[..., last_idx],
+                'inv': self.env.inv[..., last_idx],
+                'waste_inv': self.env.waste_inv[..., last_idx],
+                'raw_leader_return': raw_leader_return,
+                'buyer_avg_return': np.mean(batch_rets[BUYER]),
+                'trans_avg_return': np.mean(batch_rets[TRANSFORM])
+            }
+            np.save(f"{debug_folder}/epoch={i_so_far}_results.npy", curr_epoch_results_dict)
